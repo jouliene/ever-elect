@@ -3,6 +3,7 @@ use minik2::*;
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::signal;
 use tokio::time::{Duration, sleep};
@@ -13,9 +14,17 @@ const MASTERCHAIN: i8 = -1;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config_path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| DEFAULT_CONFIG_PATH.to_owned());
+    match CliCommand::parse()? {
+        CliCommand::Run { config_path } => run(config_path).await,
+        CliCommand::Init { config_path } => init(config_path),
+        CliCommand::Help => {
+            print_help();
+            Ok(())
+        }
+    }
+}
+
+async fn run(config_path: PathBuf) -> Result<()> {
     let app = AppConfig::load(config_path)?;
     let node_keys_file = NodeKeysFile::load(&app.node_keys_path)?;
     let elections = ElectionsFile::load(&app.elections_path)?;
@@ -122,6 +131,167 @@ async fn shutdown_signal() {
     ctrl_c.await;
 }
 
+enum CliCommand {
+    Run { config_path: PathBuf },
+    Init { config_path: PathBuf },
+    Help,
+}
+
+impl CliCommand {
+    fn parse() -> Result<Self> {
+        let args = std::env::args().skip(1).collect::<Vec<_>>();
+        match args.as_slice() {
+            [] => Ok(Self::Run {
+                config_path: PathBuf::from(DEFAULT_CONFIG_PATH),
+            }),
+            [cmd] if cmd == "run" => Ok(Self::Run {
+                config_path: PathBuf::from(DEFAULT_CONFIG_PATH),
+            }),
+            [cmd, path] if cmd == "run" => Ok(Self::Run {
+                config_path: PathBuf::from(path),
+            }),
+            [cmd] if cmd == "init" => Ok(Self::Init {
+                config_path: PathBuf::from(DEFAULT_CONFIG_PATH),
+            }),
+            [cmd, path] if cmd == "init" => Ok(Self::Init {
+                config_path: PathBuf::from(path),
+            }),
+            [cmd] if cmd == "help" || cmd == "--help" || cmd == "-h" => Ok(Self::Help),
+            [path] => Ok(Self::Run {
+                config_path: PathBuf::from(path),
+            }),
+            _ => bail!("invalid arguments; use `ever-elect help`"),
+        }
+    }
+}
+
+fn print_help() {
+    println!(
+        "Usage:\n  ever-elect run [config]\n  ever-elect init [config]\n  ever-elect help\n\nNo command is the same as `ever-elect run ever-elect.json`."
+    );
+}
+
+fn init(config_path: PathBuf) -> Result<()> {
+    let config_path = absolute_path(&config_path)?;
+    let created_config = write_default_config_if_missing(&config_path)?;
+    if created_config {
+        log_info(format!("created config {}", config_path.display()));
+    } else {
+        log_info(format!("config already exists {}", config_path.display()));
+    }
+
+    let exe = std::env::current_exe()
+        .context("failed to get current executable path")?
+        .canonicalize()
+        .context("failed to canonicalize current executable path")?;
+    let working_dir = std::env::current_dir()
+        .context("failed to get current directory")?
+        .canonicalize()
+        .context("failed to canonicalize current directory")?;
+    let service_path = user_service_path()?;
+
+    if let Some(parent) = service_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    fs::write(
+        &service_path,
+        service_unit(&exe, &config_path, &working_dir),
+    )
+    .with_context(|| format!("failed to write {}", service_path.display()))?;
+    log_info(format!("wrote user service {}", service_path.display()));
+
+    reload_user_systemd();
+
+    log_info("start with: systemctl --user start ever-elect.service");
+    log_info("enable with: systemctl --user enable ever-elect.service");
+    log_info("logs with: journalctl --user -u ever-elect.service -f");
+    Ok(())
+}
+
+fn write_default_config_if_missing(path: &Path) -> Result<bool> {
+    if path.exists() {
+        return Ok(false);
+    }
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+    }
+
+    fs::write(path, serde_json::to_string_pretty(&default_template())?)
+        .with_context(|| format!("failed to write default config {}", path.display()))?;
+    Ok(true)
+}
+
+fn absolute_path(path: &Path) -> Result<PathBuf> {
+    let path = expand_home(path);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(std::env::current_dir()
+            .context("failed to get current directory")?
+            .join(path))
+    }
+}
+
+fn user_service_path() -> Result<PathBuf> {
+    let home = std::env::var("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home)
+        .join(".config")
+        .join("systemd")
+        .join("user")
+        .join("ever-elect.service"))
+}
+
+fn service_unit(exe: &Path, config_path: &Path, working_dir: &Path) -> String {
+    format!(
+        "[Unit]\n\
+         Description=Ever Elect validator elections\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         WorkingDirectory={}\n\
+         ExecStart={} run {}\n\
+         Restart=always\n\
+         RestartSec=10\n\
+         KillSignal=SIGTERM\n\
+         TimeoutStopSec=30\n\
+         \n\
+         [Install]\n\
+         WantedBy=default.target\n",
+        systemd_quote(working_dir),
+        systemd_quote(exe),
+        systemd_quote(config_path)
+    )
+}
+
+fn systemd_quote(path: &Path) -> String {
+    let path = path.display().to_string();
+    if !path.contains([' ', '\t', '"', '\\']) {
+        return path;
+    }
+
+    let escaped = path.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+fn reload_user_systemd() {
+    match ProcessCommand::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .status()
+    {
+        Ok(status) if status.success() => log_info("reloaded user systemd manager"),
+        Ok(status) => log_error(format!(
+            "systemctl --user daemon-reload exited with {status}"
+        )),
+        Err(e) => log_error(format!("failed to run systemctl --user daemon-reload: {e}")),
+    }
+}
+
 async fn run_once(
     transport: &Transport,
     wallet: &mut EverWallet,
@@ -156,14 +326,11 @@ async fn run_once(
             until_elections_start,
         } => {
             log_info("waiting for the elections to start");
-            Ok(clamp_wait_secs(
-                until_elections_start,
-                app.max_sleep_interval(),
-            ))
+            Ok(boundary_wait_secs(until_elections_start))
         }
         ElectionTimeline::AfterElections { until_round_end } => {
             log_info("waiting for the next validation round");
-            Ok(clamp_wait_secs(until_round_end, app.max_sleep_interval()))
+            Ok(boundary_wait_secs(until_round_end))
         }
         ElectionTimeline::Elections {
             until_elections_end,
@@ -181,10 +348,7 @@ async fn run_once(
                     "already participating election_id={} stake={} source={}",
                     current.elect_at, member.msg_value, member.src_addr
                 ));
-                return Ok(clamp_wait_secs(
-                    until_elections_end,
-                    app.max_sleep_interval(),
-                ));
+                return Ok(boundary_wait_secs(until_elections_end));
             }
 
             if let Some(credit) = elector_data.credit_for(&wallet.address().address) {
@@ -249,10 +413,7 @@ async fn run_once(
                         "election request confirmed election_id={} registered_stake={}",
                         current.elect_at, member.msg_value
                     ));
-                    return Ok(clamp_wait_secs(
-                        until_elections_end,
-                        app.max_sleep_interval(),
-                    ));
+                    return Ok(boundary_wait_secs(until_elections_end));
                 }
 
                 log_info(format!(
@@ -300,10 +461,8 @@ async fn send_elector_message(
     Err(last_error.expect("attempts is never zero"))
 }
 
-fn clamp_wait_secs(wait_secs: u32, max: Duration) -> Duration {
-    Duration::from_secs(wait_secs as u64)
-        .max(Duration::from_secs(5))
-        .min(max)
+fn boundary_wait_secs(wait_secs: u32) -> Duration {
+    Duration::from_secs(wait_secs as u64).max(Duration::from_secs(5))
 }
 
 fn now_sec() -> u32 {
@@ -326,7 +485,6 @@ struct AppConfig {
     confirmation_attempts: usize,
     confirmation_interval_secs: u64,
     poll_interval_secs: u64,
-    max_sleep_interval_secs: u64,
     error_retry_interval_secs: u64,
 }
 
@@ -344,7 +502,6 @@ impl Default for AppConfig {
             confirmation_attempts: 20,
             confirmation_interval_secs: 3,
             poll_interval_secs: 60,
-            max_sleep_interval_secs: 300,
             error_retry_interval_secs: 30,
         }
     }
@@ -355,8 +512,7 @@ impl AppConfig {
         let path = path.as_ref();
         if !path.exists() {
             let default = Self::default();
-            fs::write(path, serde_json::to_string_pretty(&default_template())?)
-                .with_context(|| format!("failed to write default config {}", path.display()))?;
+            write_default_config_if_missing(path)?;
             log_info(format!("created default config {}", path.display()));
             return Ok(default);
         }
@@ -368,10 +524,6 @@ impl AppConfig {
 
     fn poll_interval(&self) -> Duration {
         Duration::from_secs(self.poll_interval_secs)
-    }
-
-    fn max_sleep_interval(&self) -> Duration {
-        Duration::from_secs(self.max_sleep_interval_secs)
     }
 
     fn error_retry_interval(&self) -> Duration {
@@ -395,7 +547,6 @@ struct AppConfigTemplate<'a> {
     confirmation_attempts: usize,
     confirmation_interval_secs: u64,
     poll_interval_secs: u64,
-    max_sleep_interval_secs: u64,
     error_retry_interval_secs: u64,
 }
 
@@ -411,7 +562,6 @@ fn default_template() -> AppConfigTemplate<'static> {
         confirmation_attempts: 20,
         confirmation_interval_secs: 3,
         poll_interval_secs: 60,
-        max_sleep_interval_secs: 300,
         error_retry_interval_secs: 30,
     }
 }
