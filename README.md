@@ -86,6 +86,11 @@ when ever-elect calculates the ordinary stake. The calculation also reserves the
 participate value and a small gas margin so the wallet is not drained by
 staking.
 
+Ordinary DePool stake is tracked per round. ever-elect checks the current
+pooling side, following nodekeeper's `pooling + previous` accounting, and only
+adds the missing validator assurance for that side instead of trusting the
+participant total across all rounds.
+
 ## Run
 
 Manual run:

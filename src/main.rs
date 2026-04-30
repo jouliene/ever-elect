@@ -17,7 +17,6 @@ const MASTERCHAIN: i8 = -1;
 const BASECHAIN: i8 = 0;
 const DEFAULT_DEPOOL_PARTICIPATE_VALUE: &str = "5";
 const DEFAULT_DEPOOL_WALLET_RESERVE: &str = "20";
-const DEPOOL_ROUND_STEP_POOLING: u8 = 1;
 const DEPOOL_ROUND_STEP_WAITING_VALIDATOR_REQUEST: u8 = 2;
 
 #[tokio::main]
@@ -765,6 +764,7 @@ async fn run_depool_election(
         let receipt = depool.ticktock(wallet).await?;
         log_info(format!("depool_ticktock_hash={}", receipt.message_hash));
         depool.update().await?;
+        ensure_depool_round_stake(wallet, depool, depool_config, app).await?;
     }
 
     let required_stake = required_depool_stake(depool, depool_config)?;
@@ -893,22 +893,30 @@ async fn prepare_depool(
         );
     }
 
-    let participant_stake = depool
-        .get_participant_info(wallet.address())?
-        .map(|participant| participant.total_round_stake)
-        .unwrap_or_default();
-    let required = required_depool_stake(depool, config)?;
+    ensure_depool_round_stake(wallet, depool, config, app).await
+}
 
-    if participant_stake >= required as u128 {
+async fn ensure_depool_round_stake(
+    wallet: &mut EverWallet,
+    depool: &mut DePool,
+    config: &DepoolRuntimeConfig,
+    app: &AppConfig,
+) -> Result<()> {
+    let participant = depool.get_participant_info(wallet.address())?;
+    let required = required_depool_stake(depool, config)?;
+    let round_stake = depool_pooling_round_stake(depool, participant);
+
+    if round_stake.current >= required as u128 {
         log_info(format!(
-            "depool_validator_stake_ready current={} required={}",
-            participant_stake, required
+            "depool_validator_stake_ready current={} required={} target_rounds={}",
+            round_stake.current, required, round_stake.rounds_label
         ));
         return Ok(());
     }
 
     wallet.update().await?;
-    let missing_stake = (required as u128).saturating_sub(participant_stake);
+    let missing_stake = (required as u128).saturating_sub(round_stake.current);
+    let stake_to_add = missing_stake.max(depool.min_stake as u128);
     let Some(stake_budget) = depool_available_stake(wallet.balance(), app)? else {
         log_info(format!(
             "wallet balance is too low for DePool staking balance={} required={} wallet_reserve={} participate_reserve={} gas_reserve={}",
@@ -920,27 +928,29 @@ async fn prepare_depool(
         ));
         return Ok(());
     };
-    let stake_to_add = missing_stake.min(stake_budget.stake);
 
-    if stake_to_add < missing_stake {
+    if stake_to_add > stake_budget.stake {
         log_info(format!(
-            "wallet balance is too low to reach DePool assurance balance={} current={} required={} missing={} available_stake={}",
+            "wallet balance is too low to reach DePool assurance balance={} current={} required={} missing={} stake_to_add={} available_stake={} target_rounds={}",
             wallet.balance(),
-            participant_stake,
+            round_stake.current,
             required,
             missing_stake,
-            stake_budget.stake
+            stake_to_add,
+            stake_budget.stake,
+            round_stake.rounds_label
         ));
         return Ok(());
     }
 
     log_info(format!(
-        "depool_validator_stake_missing current={} required={} missing={} stake_to_add={} available_stake={} wallet_reserve={} participate_reserve={} gas_reserve={}",
-        participant_stake,
+        "depool_validator_stake_missing current={} required={} missing={} stake_to_add={} available_stake={} target_rounds={} wallet_reserve={} participate_reserve={} gas_reserve={}",
+        round_stake.current,
         required,
         missing_stake,
         stake_to_add,
         stake_budget.stake,
+        round_stake.rounds_label,
         stake_budget.wallet_reserve,
         stake_budget.participate_reserve,
         stake_budget.gas_reserve
@@ -992,6 +1002,50 @@ fn required_depool_stake(depool: &DePool, config: &DepoolRuntimeConfig) -> Resul
         .validator_assurance
         .max(depool.min_stake)
         .max(config.new_validator_assurance_nano()?))
+}
+
+#[derive(Debug, Clone)]
+struct DePoolRoundStake {
+    current: u128,
+    rounds_label: String,
+}
+
+fn depool_pooling_round_stake(
+    depool: &DePool,
+    participant: Option<&DePoolParticipant>,
+) -> DePoolRoundStake {
+    let rounds = depool.get_rounds();
+
+    if rounds.len() >= 3 {
+        let prev_round = &rounds[0];
+        let pooling_round = &rounds[2];
+        let current = participant_round_stake(participant, pooling_round.id)
+            + participant_round_stake(participant, prev_round.id);
+
+        return DePoolRoundStake {
+            current,
+            rounds_label: format!("pooling:{}+prev:{}", pooling_round.id, prev_round.id),
+        };
+    }
+
+    DePoolRoundStake {
+        current: participant
+            .map(|participant| participant.total_round_stake)
+            .unwrap_or_default(),
+        rounds_label: "all".to_owned(),
+    }
+}
+
+fn participant_round_stake(participant: Option<&DePoolParticipant>, round_id: u64) -> u128 {
+    participant
+        .and_then(|participant| {
+            participant
+                .rounds
+                .iter()
+                .find(|round| round.round_id == round_id)
+        })
+        .map(|round| round.total as u128)
+        .unwrap_or_default()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1166,27 +1220,25 @@ fn select_ready_depool_round(
         bail!("DePool has no proxies");
     }
 
-    let rounds = depool.get_rounds();
-    let exact = rounds.iter().find(|round| {
-        round.supposed_elected_at == election_id
-            && round.step == DEPOOL_ROUND_STEP_WAITING_VALIDATOR_REQUEST
-            && round.stake >= required_stake
-    });
-    let fallback_pooling = rounds
+    Ok(depool
+        .get_rounds()
         .iter()
-        .find(|round| round.step == DEPOOL_ROUND_STEP_POOLING && round.stake >= required_stake);
-
-    Ok(exact.or(fallback_pooling).map(|round| {
-        let proxy = depool.proxies[(round.id as usize) % depool.proxies.len()].clone();
-        ReadyDePoolRound {
-            id: round.id,
-            step: round.step,
-            supposed_elected_at: round.supposed_elected_at,
-            proxy,
-            stake: round.stake,
-            validator_stake: round.validator_stake,
-        }
-    }))
+        .find(|round| {
+            round.supposed_elected_at == election_id
+                && round.step == DEPOOL_ROUND_STEP_WAITING_VALIDATOR_REQUEST
+                && round.stake >= required_stake
+        })
+        .map(|round| {
+            let proxy = depool.proxies[(round.id as usize) % depool.proxies.len()].clone();
+            ReadyDePoolRound {
+                id: round.id,
+                step: round.step,
+                supposed_elected_at: round.supposed_elected_at,
+                proxy,
+                stake: round.stake,
+                validator_stake: round.validator_stake,
+            }
+        }))
 }
 
 fn format_depool_rounds(depool: &DePool) -> String {
