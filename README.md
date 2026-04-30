@@ -12,10 +12,12 @@ directly from a masterchain Ever Wallet or through a workchain DePool.
 git clone https://github.com/jouliene/ever-elect.git
 cd ever-elect
 ./install.sh
+source "$HOME/.cargo/env"
 ever-elect init
 ```
 
-The installer builds the release binary and copies it to:
+The installer installs Rust with `rustup` when `cargo` is missing, then builds
+the release binary and copies it to:
 
 ```text
 ~/.cargo/bin/ever-elect
