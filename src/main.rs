@@ -18,6 +18,8 @@ const BASECHAIN: i8 = 0;
 const DEFAULT_DEPOOL_PARTICIPATE_VALUE: &str = "5";
 const DEFAULT_DEPOOL_WALLET_RESERVE: &str = "20";
 const DEPOOL_ROUND_STEP_WAITING_VALIDATOR_REQUEST: u8 = 2;
+const DEPOOL_PROXY_MIN_BALANCE: u128 = 3 * ONE_TOKEN;
+const DEPOOL_PROXY_TARGET_BALANCE: u128 = 5 * ONE_TOKEN;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -595,7 +597,7 @@ async fn run_once(
 
     match &mut runtime.validation {
         RuntimeValidation::Depool { depool, config } => {
-            prepare_depool(&mut runtime.wallet, depool.as_mut(), config, app).await?;
+            prepare_depool(transport, &mut runtime.wallet, depool.as_mut(), config, app).await?;
         }
         RuntimeValidation::Simple { .. } => {}
     }
@@ -837,6 +839,7 @@ async fn run_depool_election(
 }
 
 async fn prepare_depool(
+    transport: &Transport,
     wallet: &mut EverWallet,
     depool: &mut DePool,
     config: &DepoolRuntimeConfig,
@@ -883,6 +886,8 @@ async fn prepare_depool(
         depool.update().await?;
     }
 
+    maintain_depool_proxy_balances(transport, wallet, depool, app).await?;
+
     if let Some(validator_wallet) = &depool.validator_wallet
         && validator_wallet != wallet.address()
     {
@@ -894,6 +899,65 @@ async fn prepare_depool(
     }
 
     ensure_depool_round_stake(wallet, depool, config, app).await
+}
+
+async fn maintain_depool_proxy_balances(
+    transport: &Transport,
+    wallet: &mut EverWallet,
+    depool: &DePool,
+    app: &AppConfig,
+) -> Result<()> {
+    if depool.proxies.is_empty() {
+        log_info("depool has no proxies yet; skipping proxy balance check");
+        return Ok(());
+    }
+
+    for proxy in &depool.proxies {
+        let proxy_balance = account_balance(transport, proxy).await?;
+        if proxy_balance >= DEPOOL_PROXY_MIN_BALANCE {
+            log_info(format!(
+                "depool_proxy_balance_ready proxy={} balance={}",
+                proxy, proxy_balance
+            ));
+            continue;
+        }
+
+        let topup = DEPOOL_PROXY_TARGET_BALANCE.saturating_sub(proxy_balance);
+        log_info(format!(
+            "depool_proxy_balance_low proxy={} balance={} target={} topup={}",
+            proxy, proxy_balance, DEPOOL_PROXY_TARGET_BALANCE, topup
+        ));
+
+        if !app.send {
+            log_info("dry run enabled; skipping DePool proxy topup");
+            continue;
+        }
+
+        wallet.update().await?;
+        let reserve = app
+            .depool_wallet_reserve_nano()?
+            .saturating_add(app.depool_participate_value_nano()?)
+            .saturating_add(DEFAULT_DEPOOL_GAS);
+        if wallet.balance() <= topup.saturating_add(reserve) {
+            log_info(format!(
+                "wallet balance is too low for DePool proxy topup balance={} topup={} reserve={}",
+                wallet.balance(),
+                topup,
+                reserve
+            ));
+            continue;
+        }
+
+        let receipt = wallet
+            .send_transaction_safe_with_retry(proxy, topup, false, 3, None, app.retry)
+            .await?;
+        log_info(format!(
+            "depool_proxy_topup_hash={} proxy={} value={}",
+            receipt.message_hash, proxy, topup
+        ));
+    }
+
+    Ok(())
 }
 
 async fn ensure_depool_round_stake(
@@ -1046,6 +1110,15 @@ fn participant_round_stake(participant: Option<&DePoolParticipant>, round_id: u6
         })
         .map(|round| round.total as u128)
         .unwrap_or_default()
+}
+
+async fn account_balance(transport: &Transport, address: &StdAddr) -> Result<u128> {
+    Ok(transport
+        .get_account_state(address.to_string())
+        .await?
+        .account()
+        .map(|account| account.balance.tokens.into())
+        .unwrap_or_default())
 }
 
 #[allow(clippy::too_many_arguments)]
