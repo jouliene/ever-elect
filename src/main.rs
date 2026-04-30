@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, bail};
 use minik2::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,14 +10,20 @@ use tokio::signal;
 use tokio::time::{Duration, sleep};
 
 const CONFIG_FILE_NAME: &str = "ever-elect.json";
+const DEFAULT_ENDPOINT: &str = "https://rpc-testnet.tychoprotocol.com";
+const DEFAULT_CONFIG_FOLDER: &str = "~/.tycho";
 const ONE_TOKEN: u128 = 1_000_000_000;
 const MASTERCHAIN: i8 = -1;
+const BASECHAIN: i8 = 0;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     match CliCommand::parse()? {
         CliCommand::Run { config_path } => run(config_path).await,
-        CliCommand::Init { config_path } => init(config_path),
+        CliCommand::Init {
+            config_path,
+            explicit_path,
+        } => init(config_path, explicit_path),
         CliCommand::Help => {
             print_help();
             Ok(())
@@ -27,37 +34,23 @@ async fn main() -> Result<()> {
 async fn run(config_path: PathBuf) -> Result<()> {
     let app = AppConfig::load(config_path)?;
     let node_keys_file = NodeKeysFile::load(&app.node_keys_path)?;
-    let elections = ElectionsFile::load(&app.elections_path)?;
-
     let node_keys =
         KeyPair::from_secret_hex(&node_keys_file.secret).context("invalid node secret")?;
-    let wallet_keys =
-        KeyPair::from_secret_hex(&elections.wallet_secret).context("invalid wallet secret")?;
 
     if node_keys.public_key_hex() != node_keys_file.public {
         bail!("node public key does not match node secret");
     }
-    if wallet_keys.public_key_hex() != elections.wallet_public {
-        bail!("wallet public key does not match wallet secret");
-    }
 
     let transport = Transport::jrpc(&app.endpoint)?;
-    let mut wallet = EverWallet::with_workchain(&transport, wallet_keys, MASTERCHAIN)?;
-
-    if wallet.address().to_string() != elections.wallet_address {
-        bail!(
-            "wallet address mismatch: config has {}, derived {}",
-            elections.wallet_address,
-            wallet.address()
-        );
-    }
+    let mut runtime = RuntimeState::new(&transport, &app)?;
 
     log_info("started validation loop");
     log_info("transport=jrpc");
     log_info(format!("endpoint={}", app.endpoint));
-    log_info(format!("wallet={}", wallet.address()));
+    log_info(format!("node_keys={}", app.node_keys_path.display()));
+    log_info(format!("validation={}", runtime.validation.name()));
+    log_info(format!("wallet={}", runtime.wallet.address()));
     log_info(format!("validator_public={}", node_keys.public_key_hex()));
-    log_info(format!("stake={}", elections.stake_nano()?));
     log_info(format!("send_enabled={}", app.send));
 
     let shutdown = shutdown_signal();
@@ -69,7 +62,7 @@ async fn run(config_path: PathBuf) -> Result<()> {
                 log_info("shutdown signal received");
                 break;
             }
-            wait = run_once(&transport, &mut wallet, &node_keys, &elections, &app) => {
+            wait = run_once(&transport, &mut runtime, &node_keys, &app) => {
                 let wait = match wait {
                     Ok(wait) => wait,
                     Err(e) => {
@@ -132,8 +125,13 @@ async fn shutdown_signal() {
 }
 
 enum CliCommand {
-    Run { config_path: PathBuf },
-    Init { config_path: PathBuf },
+    Run {
+        config_path: PathBuf,
+    },
+    Init {
+        config_path: PathBuf,
+        explicit_path: bool,
+    },
     Help,
 }
 
@@ -152,9 +150,11 @@ impl CliCommand {
             }),
             [cmd] if cmd == "init" => Ok(Self::Init {
                 config_path: default_config_path(),
+                explicit_path: false,
             }),
             [cmd, path] if cmd == "init" => Ok(Self::Init {
                 config_path: PathBuf::from(path),
+                explicit_path: true,
             }),
             [cmd] if cmd == "help" || cmd == "--help" || cmd == "-h" => Ok(Self::Help),
             [path] => Ok(Self::Run {
@@ -171,13 +171,54 @@ fn print_help() {
     );
 }
 
-fn init(config_path: PathBuf) -> Result<()> {
+fn init(config_path: PathBuf, explicit_path: bool) -> Result<()> {
     let config_path = absolute_path(&config_path)?;
-    let created_config = write_default_config_if_missing(&config_path)?;
-    if created_config {
-        log_info(format!("created config {}", config_path.display()));
+    let default_folder = if explicit_path {
+        config_path
+            .parent()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| DEFAULT_CONFIG_FOLDER.to_owned())
     } else {
-        log_info(format!("config already exists {}", config_path.display()));
+        DEFAULT_CONFIG_FOLDER.to_owned()
+    };
+
+    println!("ever-elect init");
+    let endpoint = prompt_text("Endpoint", DEFAULT_ENDPOINT)?;
+    let config_folder = prompt_text("Config folder", &default_folder)?;
+    let node_keys_path = join_user_path(&config_folder, "node_keys.json");
+
+    if !expand_home(&node_keys_path).exists() {
+        bail!(
+            "node keys not found at {}; initialize the node first with `tycho node init`",
+            node_keys_path.display()
+        );
+    }
+
+    let validation = prompt_validation(&config_folder)?;
+    let config = AppConfig {
+        endpoint,
+        node_keys_path,
+        elections_path: None,
+        validation,
+        ..AppConfig::default()
+    };
+
+    let write_path = if explicit_path {
+        config_path
+    } else {
+        expand_home(&join_user_path(&config_folder, CONFIG_FILE_NAME))
+    };
+
+    if write_path.exists()
+        && !prompt_confirm(
+            &format!("Overwrite existing {}?", write_path.display()),
+            false,
+        )?
+    {
+        log_info(format!("left config unchanged {}", write_path.display()));
+    } else {
+        write_config(&write_path, &config)?;
+        log_info(format!("wrote config {}", write_path.display()));
     }
 
     let exe = std::env::current_exe()
@@ -195,11 +236,8 @@ fn init(config_path: PathBuf) -> Result<()> {
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    fs::write(
-        &service_path,
-        service_unit(&exe, &config_path, &working_dir),
-    )
-    .with_context(|| format!("failed to write {}", service_path.display()))?;
+    fs::write(&service_path, service_unit(&exe, &write_path, &working_dir))
+        .with_context(|| format!("failed to write {}", service_path.display()))?;
     log_info(format!("wrote user service {}", service_path.display()));
 
     reload_user_systemd();
@@ -210,27 +248,220 @@ fn init(config_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn write_default_config_if_missing(path: &Path) -> Result<bool> {
-    if path.exists() {
-        return Ok(false);
+fn prompt_validation(config_folder: &str) -> Result<ValidationConfig> {
+    match prompt_choice("Type of validation", &["Simple", "Depool"], 1)? {
+        1 => {
+            let wallet = match prompt_choice(
+                "Validator's wallet (must be in masterchain: -1:...)",
+                &["Use from elections.json", "Create new", "Restore from seed"],
+                1,
+            )? {
+                1 => SimpleWalletConfig::ElectionsJson {
+                    path: Some(join_user_path(config_folder, "elections.json")),
+                },
+                2 => SimpleWalletConfig::Stored {
+                    wallet: create_wallet_config(MASTERCHAIN)?,
+                },
+                3 => SimpleWalletConfig::Stored {
+                    wallet: restore_wallet_config(MASTERCHAIN)?,
+                },
+                _ => unreachable!(),
+            };
+
+            let stake = prompt_simple_stake()?;
+
+            Ok(ValidationConfig::Simple(SimpleValidationConfig {
+                wallet,
+                stake,
+            }))
+        }
+        2 => {
+            let validator_wallet = match prompt_choice(
+                "Validator's wallet (must be in workchain: 0:...)",
+                &["Create new", "Restore from seed"],
+                1,
+            )? {
+                1 => create_wallet_config(BASECHAIN)?,
+                2 => restore_wallet_config(BASECHAIN)?,
+                _ => unreachable!(),
+            };
+
+            let depool = match prompt_choice("Depool", &["Create new", "Use existing"], 1)? {
+                1 => DepoolConfig::New(prompt_new_depool_config(&validator_wallet)?),
+                2 => {
+                    let address = prompt_text("Existing DePool address (workchain 0)", "")?;
+                    ensure_workchain(&address, BASECHAIN)?;
+                    DepoolConfig::Existing { address }
+                }
+                _ => unreachable!(),
+            };
+
+            Ok(ValidationConfig::Depool(DepoolValidationConfig {
+                validator_wallet,
+                depool,
+            }))
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn prompt_simple_stake() -> Result<StakeConfig> {
+    match prompt_choice(
+        "Stake size for simple validation",
+        &[
+            "Fixed amount",
+            "Float: use wallet balance except reserved amount",
+        ],
+        1,
+    )? {
+        1 => {
+            let amount = prompt_token_amount("Fixed stake amount", "500000")?;
+            Ok(StakeConfig::Fixed { amount })
+        }
+        2 => {
+            let keep_wallet_balance = prompt_token_amount("Keep on wallet before staking", "100")?;
+            Ok(StakeConfig::Float {
+                keep_wallet_balance,
+            })
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn create_wallet_config(workchain: i8) -> Result<StoredWalletConfig> {
+    let seed = Seed::generate()?;
+    let wallet = StoredWalletConfig::from_seed(seed.as_str(), workchain)?;
+
+    println!("Generated wallet:");
+    println!("  address: {}", wallet.address);
+    println!("  public:  {}", wallet.public);
+    println!("  seed:    {}", seed.as_str());
+    println!("Back up this seed. It will also be stored in ever-elect.json.");
+
+    Ok(wallet)
+}
+
+fn restore_wallet_config(workchain: i8) -> Result<StoredWalletConfig> {
+    let seed = prompt_text("Seed phrase", "")?;
+    let wallet = StoredWalletConfig::from_seed(&seed, workchain)?;
+
+    println!("Restored wallet:");
+    println!("  address: {}", wallet.address);
+    println!("  public:  {}", wallet.public);
+
+    Ok(wallet)
+}
+
+fn prompt_new_depool_config(validator_wallet: &StoredWalletConfig) -> Result<NewDepoolConfig> {
+    let seed = Seed::generate()?;
+    let keys = KeyPair::from_seed(seed.as_str())?;
+    let address = DePool::compute_address(BASECHAIN, &keys)?.to_string();
+    let min_stake = prompt_token_amount("DePool min stake", "100")?;
+    let validator_assurance = prompt_token_amount("Validator assurance", "500")?;
+    let participant_reward_fraction = prompt_u8("Participant reward fraction", 95)?;
+
+    println!("Generated DePool:");
+    println!("  address:          {address}");
+    println!("  public:           {}", keys.public_key_hex());
+    println!("  seed:             {}", seed.as_str());
+    println!("  validator wallet: {}", validator_wallet.address);
+
+    Ok(NewDepoolConfig {
+        address,
+        seed: Some(seed.to_string()),
+        public: keys.public_key_hex(),
+        secret: keys.secret_key_hex(),
+        min_stake,
+        validator_assurance,
+        participant_reward_fraction,
+    })
+}
+
+fn prompt_text(label: &str, default: &str) -> Result<String> {
+    if default.is_empty() {
+        print!("{label}: ");
+    } else {
+        print!("{label} [{default}]: ");
+    }
+    io::stdout().flush().context("failed to flush stdout")?;
+
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .context("failed to read stdin")?;
+    let input = input.trim();
+
+    if input.is_empty() {
+        Ok(default.to_owned())
+    } else {
+        Ok(input.to_owned())
+    }
+}
+
+fn prompt_choice(label: &str, options: &[&str], default: usize) -> Result<usize> {
+    println!("{label}:");
+    for (idx, option) in options.iter().enumerate() {
+        println!("{}. {}", idx + 1, option);
     }
 
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
+    loop {
+        let input = prompt_text("Select", &default.to_string())?;
+        let choice = input
+            .parse::<usize>()
+            .with_context(|| format!("invalid choice `{input}`"))?;
+        if (1..=options.len()).contains(&choice) {
+            return Ok(choice);
+        }
+        println!("Choose a number from 1 to {}", options.len());
+    }
+}
+
+fn prompt_confirm(label: &str, default: bool) -> Result<bool> {
+    let default_text = if default { "Y/n" } else { "y/N" };
+    loop {
+        let input = prompt_text(label, default_text)?;
+        match input.to_ascii_lowercase().as_str() {
+            "" => return Ok(default),
+            "y" | "yes" | "Y/n" | "y/n" => return Ok(true),
+            "n" | "no" | "N/y" | "n/y" | "y/N" | "Y/N" => return Ok(false),
+            _ => println!("Please answer y or n"),
         }
     }
+}
 
-    let config = format!("{}\n", serde_json::to_string_pretty(&default_template())?);
-    fs::write(path, config)
-        .with_context(|| format!("failed to write default config {}", path.display()))?;
-    Ok(true)
+fn prompt_token_amount(label: &str, default: &str) -> Result<String> {
+    let value = prompt_text(label, default)?;
+    parse_tokens_to_nano(&value).with_context(|| format!("invalid token amount `{value}`"))?;
+    Ok(value)
+}
+
+fn prompt_u8(label: &str, default: u8) -> Result<u8> {
+    let value = prompt_text(label, &default.to_string())?;
+    value
+        .parse::<u8>()
+        .with_context(|| format!("invalid u8 value `{value}`"))
+}
+
+fn write_config(path: &Path, config: &AppConfig) -> Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let config = format!("{}\n", serde_json::to_string_pretty(config)?);
+    fs::write(path, config).with_context(|| format!("failed to write {}", path.display()))
 }
 
 fn default_config_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
     PathBuf::from(home).join(".tycho").join(CONFIG_FILE_NAME)
+}
+
+fn default_elections_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
+    PathBuf::from(home).join(".tycho").join("elections.json")
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf> {
@@ -242,6 +473,10 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
             .context("failed to get current directory")?
             .join(path))
     }
+}
+
+fn join_user_path(folder: &str, file_name: &str) -> PathBuf {
+    PathBuf::from(folder).join(file_name)
 }
 
 fn user_service_path() -> Result<PathBuf> {
@@ -300,9 +535,8 @@ fn reload_user_systemd() {
 
 async fn run_once(
     transport: &Transport,
-    wallet: &mut EverWallet,
+    runtime: &mut RuntimeState,
     node_keys: &KeyPair,
-    elections: &ElectionsFile,
     app: &AppConfig,
 ) -> Result<Duration> {
     let config = Config::fetch(transport).await?;
@@ -312,7 +546,7 @@ async fn run_once(
         .get_account_state(elector.address().to_string())
         .await?;
 
-    wallet.update().await?;
+    runtime.wallet.update().await?;
 
     let gen_utime = elector_state
         .timings()
@@ -324,8 +558,15 @@ async fn run_once(
         "gen_utime={} time_diff={} timeline={timeline:?} wallet_balance={}",
         gen_utime,
         now_sec().saturating_sub(gen_utime),
-        wallet.balance()
+        runtime.wallet.balance()
     ));
+
+    match &mut runtime.validation {
+        RuntimeValidation::Depool { depool, config } => {
+            prepare_depool(&mut runtime.wallet, depool.as_mut(), config, app).await?;
+        }
+        RuntimeValidation::Simple { .. } => {}
+    }
 
     match timeline {
         ElectionTimeline::BeforeElections {
@@ -348,89 +589,378 @@ async fn run_once(
                 return Ok(app.poll_interval());
             };
 
-            let validator_key = HashBytes(node_keys.public_key_bytes());
-            if let Some(member) = current.member(&validator_key) {
-                log_info(format!(
-                    "already participating election_id={} stake={} source={}",
-                    current.elect_at, member.msg_value, member.src_addr
-                ));
-                return Ok(boundary_wait_secs(until_elections_end));
-            }
-
-            if let Some(credit) = elector_data.credit_for(&wallet.address().address) {
-                if credit > 0 {
-                    log_info(format!("recoverable_previous_stake={credit}"));
-                    if app.send {
-                        let message =
-                            elector.recover_stake_message(config.compute_price_factor(true)?)?;
-                        let receipt =
-                            send_elector_message(wallet, &config, &message, app.retry).await?;
-                        log_info(format!("recover_message_hash={}", receipt.message_hash));
-                    }
+            match &mut runtime.validation {
+                RuntimeValidation::Simple {
+                    stake,
+                    elections_stake,
+                } => {
+                    run_simple_election(
+                        &config,
+                        &elector,
+                        current,
+                        &elector_data,
+                        &mut runtime.wallet,
+                        node_keys,
+                        stake,
+                        elections_stake.as_deref(),
+                        app,
+                        elections_end,
+                        until_elections_end,
+                    )
+                    .await
+                }
+                RuntimeValidation::Depool {
+                    depool,
+                    config: depool_config,
+                } => {
+                    run_depool_election(
+                        &config,
+                        &elector,
+                        current,
+                        depool.as_mut(),
+                        depool_config,
+                        &mut runtime.wallet,
+                        node_keys,
+                        app,
+                        elections_end,
+                        until_elections_end,
+                    )
+                    .await
                 }
             }
-
-            let stake = elections.stake_nano()?;
-            config.check_stake(stake)?;
-            let stake_factor = config.compute_stake_factor(app.stake_factor)?;
-
-            log_info(format!(
-                "prepared election request election_id={} elector_election_id={} until_end={} stake={} stake_factor={}",
-                elections_end, current.elect_at, until_elections_end, stake, stake_factor
-            ));
-
-            if !app.send {
-                log_info("dry run enabled; set send=true in ever-elect config to submit stake");
-                return Ok(app.poll_interval());
-            }
-
-            let message = elector.participate_message(ParticipateParams {
-                node_keys,
-                wallet_address: &wallet.address().address,
-                election_id: current.elect_at,
-                stake,
-                stake_factor,
-                price_factor: config.compute_price_factor(true)?,
-                signature_context: config.signature_context()?,
-            })?;
-            let receipt = send_elector_message(wallet, &config, &message, app.retry).await?;
-            log_info(format!("participate_message_hash={}", receipt.message_hash));
-
-            for attempt in 1..=app.confirmation_attempts.max(1) {
-                if attempt > 1 {
-                    sleep(app.confirmation_interval()).await;
-                }
-
-                let updated = elector.get_data().await?;
-                let Some(current) = updated.current_election() else {
-                    log_info(format!(
-                        "waiting for election confirmation attempt={} reason=no_current_election",
-                        attempt
-                    ));
-                    continue;
-                };
-
-                if let Some(member) = current.member(&validator_key) {
-                    if member.src_addr != wallet.address().address {
-                        bail!("registered election source address does not match wallet");
-                    }
-
-                    log_info(format!(
-                        "election request confirmed election_id={} registered_stake={}",
-                        current.elect_at, member.msg_value
-                    ));
-                    return Ok(boundary_wait_secs(until_elections_end));
-                }
-
-                log_info(format!(
-                    "waiting for election confirmation attempt={} election_id={}",
-                    attempt, current.elect_at
-                ));
-            }
-
-            bail!("validator key is not registered after participation confirmation timeout")
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_simple_election(
+    config: &Config,
+    elector: &Elector,
+    current: &CurrentElectionData,
+    elector_data: &ElectorData,
+    wallet: &mut EverWallet,
+    node_keys: &KeyPair,
+    stake_config: &StakeConfig,
+    elections_stake: Option<&str>,
+    app: &AppConfig,
+    elections_end: u32,
+    until_elections_end: u32,
+) -> Result<Duration> {
+    let validator_key = HashBytes(node_keys.public_key_bytes());
+    if let Some(member) = current.member(&validator_key) {
+        log_info(format!(
+            "already participating election_id={} stake={} source={}",
+            current.elect_at, member.msg_value, member.src_addr
+        ));
+        return Ok(boundary_wait_secs(until_elections_end));
+    }
+
+    if let Some(credit) = elector_data.credit_for(&wallet.address().address)
+        && credit > 0
+    {
+        log_info(format!("recoverable_previous_stake={credit}"));
+        if app.send {
+            let message = elector.recover_stake_message(config.compute_price_factor(true)?)?;
+            let receipt = send_elector_message(wallet, config, &message, app.retry).await?;
+            log_info(format!("recover_message_hash={}", receipt.message_hash));
+        }
+    }
+
+    let elector_gas = apply_price_factor(ONE_TOKEN, config.compute_price_factor(true)?);
+    let stake = stake_config.stake_nano(wallet.balance(), elector_gas, elections_stake)?;
+    config.check_stake(stake)?;
+    let stake_factor = config.compute_stake_factor(app.stake_factor)?;
+
+    log_info(format!(
+        "prepared simple election request election_id={} elector_election_id={} until_end={} stake={} stake_factor={}",
+        elections_end, current.elect_at, until_elections_end, stake, stake_factor
+    ));
+
+    if !app.send {
+        log_info("dry run enabled; set send=true in ever-elect config to submit stake");
+        return Ok(app.poll_interval());
+    }
+
+    let message = elector.participate_message(ParticipateParams {
+        node_keys,
+        wallet_address: &wallet.address().address,
+        election_id: current.elect_at,
+        stake,
+        stake_factor,
+        price_factor: config.compute_price_factor(true)?,
+        signature_context: config.signature_context()?,
+    })?;
+    let receipt = send_elector_message(wallet, config, &message, app.retry).await?;
+    log_info(format!("participate_message_hash={}", receipt.message_hash));
+
+    confirm_simple_participation(
+        elector,
+        &validator_key,
+        wallet.address(),
+        app,
+        until_elections_end,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_depool_election(
+    config: &Config,
+    elector: &Elector,
+    current: &CurrentElectionData,
+    depool: &mut DePool,
+    depool_config: &DepoolRuntimeConfig,
+    wallet: &mut EverWallet,
+    node_keys: &KeyPair,
+    app: &AppConfig,
+    elections_end: u32,
+    until_elections_end: u32,
+) -> Result<Duration> {
+    let validator_key = HashBytes(node_keys.public_key_bytes());
+    if let Some(member) = current.member(&validator_key)
+        && depool_has_source(depool, &member.src_addr)
+    {
+        log_info(format!(
+            "already participating via depool election_id={} stake={} source={}",
+            current.elect_at, member.msg_value, member.src_addr
+        ));
+        return Ok(boundary_wait_secs(until_elections_end));
+    }
+
+    depool.update().await?;
+    if app.send {
+        let receipt = depool.ticktock(wallet).await?;
+        log_info(format!("depool_ticktock_hash={}", receipt.message_hash));
+        depool.update().await?;
+    }
+
+    let proxy = select_depool_proxy(depool, current.elect_at)?;
+    let stake_factor = config.compute_stake_factor(app.stake_factor)?;
+    let adnl_addr = validator_key;
+    let data_to_sign =
+        build_elections_data_to_sign(current.elect_at, stake_factor, &proxy.address, &adnl_addr);
+    let data_to_sign = config.signature_context()?.apply(&data_to_sign);
+    let signature = node_keys.sign(&data_to_sign).to_bytes();
+
+    log_info(format!(
+        "prepared depool election request election_id={} elector_election_id={} until_end={} depool={} proxy={} stake_factor={}",
+        elections_end, current.elect_at, until_elections_end, depool.address, proxy, stake_factor
+    ));
+
+    if !app.send {
+        log_info("dry run enabled; set send=true in ever-elect config to submit DePool request");
+        return Ok(app.poll_interval());
+    }
+
+    let receipt = depool
+        .participate_in_elections(
+            wallet,
+            now_millis()?,
+            validator_key,
+            current.elect_at,
+            stake_factor,
+            adnl_addr,
+            signature,
+        )
+        .await?;
+    log_info(format!(
+        "depool_participate_message_hash={}",
+        receipt.message_hash
+    ));
+
+    confirm_depool_participation(elector, depool, &validator_key, app, until_elections_end)
+        .await
+        .with_context(|| format!("depool={}", depool_config.address))
+}
+
+async fn prepare_depool(
+    wallet: &mut EverWallet,
+    depool: &mut DePool,
+    config: &DepoolRuntimeConfig,
+    app: &AppConfig,
+) -> Result<()> {
+    depool.update().await?;
+
+    if !depool.is_active() {
+        let Some(new_depool) = config.new.as_ref() else {
+            bail!("configured DePool {} is not active", depool.address);
+        };
+
+        log_info(format!("depool_not_active address={}", depool.address));
+        if !app.send {
+            log_info("dry run enabled; skipping DePool topup/deploy");
+            return Ok(());
+        }
+
+        let target_balance = MIN_BALANCE_FOR_DEPLOY + DEFAULT_DEPOOL_GAS;
+        if depool.account_balance < target_balance {
+            let topup = target_balance - depool.account_balance;
+            log_info(format!(
+                "topping_up_depool address={} value={topup}",
+                depool.address
+            ));
+            let receipt = wallet
+                .send_transaction_safe_with_retry(&depool.address, topup, false, 3, None, app.retry)
+                .await?;
+            log_info(format!("depool_topup_hash={}", receipt.message_hash));
+            depool.update().await?;
+        }
+
+        let depool_keys = KeyPair::from_secret_hex(&new_depool.secret)?;
+        let receipt = depool
+            .deploy(
+                &depool_keys,
+                new_depool.min_stake_nano()?,
+                new_depool.validator_assurance_nano()?,
+                wallet.address(),
+                new_depool.participant_reward_fraction,
+            )
+            .await?;
+        log_info(format!("depool_deploy_hash={}", receipt.message_hash));
+        depool.update().await?;
+    }
+
+    if let Some(validator_wallet) = &depool.validator_wallet
+        && validator_wallet != wallet.address()
+    {
+        bail!(
+            "DePool validator wallet mismatch: depool has {}, configured wallet is {}",
+            validator_wallet,
+            wallet.address()
+        );
+    }
+
+    let participant_stake = depool
+        .get_participant_info(wallet.address())?
+        .map(|participant| participant.total_round_stake)
+        .unwrap_or_default();
+    let required = depool
+        .validator_assurance
+        .max(depool.min_stake)
+        .max(config.new_validator_assurance_nano()?);
+
+    if participant_stake >= required as u128 {
+        log_info(format!(
+            "depool_validator_stake_ready current={} required={}",
+            participant_stake, required
+        ));
+        return Ok(());
+    }
+
+    wallet.update().await?;
+    let Some(stake) = depool_available_stake(wallet.balance()) else {
+        log_info(format!(
+            "wallet balance is too low for DePool staking balance={} required={}",
+            wallet.balance(),
+            required
+        ));
+        return Ok(());
+    };
+
+    log_info(format!(
+        "depool_validator_stake_missing current={} required={} available_stake={}",
+        participant_stake, required, stake
+    ));
+
+    if !app.send {
+        log_info("dry run enabled; skipping DePool addOrdinaryStake");
+        return Ok(());
+    }
+
+    let receipt = depool.add_ordinary_stake(wallet, stake).await?;
+    log_info(format!("depool_add_stake_hash={}", receipt.message_hash));
+    depool.update().await?;
+    Ok(())
+}
+
+fn depool_available_stake(balance: u128) -> Option<u128> {
+    let reserve = DEFAULT_DEPOOL_GAS.saturating_mul(2);
+    (balance > reserve).then_some(balance - reserve)
+}
+
+async fn confirm_simple_participation(
+    elector: &Elector,
+    validator_key: &HashBytes,
+    wallet_address: &StdAddr,
+    app: &AppConfig,
+    until_elections_end: u32,
+) -> Result<Duration> {
+    for attempt in 1..=app.confirmation_attempts.max(1) {
+        if attempt > 1 {
+            sleep(app.confirmation_interval()).await;
+        }
+
+        let updated = elector.get_data().await?;
+        let Some(current) = updated.current_election() else {
+            log_info(format!(
+                "waiting for election confirmation attempt={} reason=no_current_election",
+                attempt
+            ));
+            continue;
+        };
+
+        if let Some(member) = current.member(validator_key) {
+            if member.src_addr != wallet_address.address {
+                bail!("registered election source address does not match wallet");
+            }
+
+            log_info(format!(
+                "election request confirmed election_id={} registered_stake={}",
+                current.elect_at, member.msg_value
+            ));
+            return Ok(boundary_wait_secs(until_elections_end));
+        }
+
+        log_info(format!(
+            "waiting for election confirmation attempt={} election_id={}",
+            attempt, current.elect_at
+        ));
+    }
+
+    bail!("validator key is not registered after participation confirmation timeout")
+}
+
+async fn confirm_depool_participation(
+    elector: &Elector,
+    depool: &mut DePool,
+    validator_key: &HashBytes,
+    app: &AppConfig,
+    until_elections_end: u32,
+) -> Result<Duration> {
+    for attempt in 1..=app.confirmation_attempts.max(1) {
+        if attempt > 1 {
+            sleep(app.confirmation_interval()).await;
+        }
+
+        depool.update().await?;
+        let updated = elector.get_data().await?;
+        let Some(current) = updated.current_election() else {
+            log_info(format!(
+                "waiting for depool election confirmation attempt={} reason=no_current_election",
+                attempt
+            ));
+            continue;
+        };
+
+        if let Some(member) = current.member(validator_key) {
+            if !depool_has_source(depool, &member.src_addr) {
+                bail!("registered election source address does not match a DePool proxy");
+            }
+
+            log_info(format!(
+                "depool election request confirmed election_id={} registered_stake={} source={}",
+                current.elect_at, member.msg_value, member.src_addr
+            ));
+            return Ok(boundary_wait_secs(until_elections_end));
+        }
+
+        log_info(format!(
+            "waiting for depool election confirmation attempt={} election_id={}",
+            attempt, current.elect_at
+        ));
+    }
+
+    bail!("validator key is not registered after DePool confirmation timeout")
 }
 
 async fn send_elector_message(
@@ -467,6 +997,26 @@ async fn send_elector_message(
     Err(last_error.expect("attempts is never zero"))
 }
 
+fn select_depool_proxy(depool: &DePool, election_id: u32) -> Result<StdAddr> {
+    if depool.proxies.is_empty() {
+        bail!("DePool has no proxies");
+    }
+
+    if let Some(round) = depool
+        .get_rounds()
+        .iter()
+        .find(|round| round.supposed_elected_at == election_id)
+    {
+        return Ok(depool.proxies[(round.id as usize) % depool.proxies.len()].clone());
+    }
+
+    Ok(depool.proxies[(election_id as usize) % depool.proxies.len()].clone())
+}
+
+fn depool_has_source(depool: &DePool, source: &HashBytes) -> bool {
+    depool.proxies.iter().any(|proxy| &proxy.address == source)
+}
+
 fn boundary_wait_secs(wait_secs: u32) -> Duration {
     Duration::from_secs(wait_secs as u64).max(Duration::from_secs(5))
 }
@@ -478,12 +1028,99 @@ fn now_sec() -> u32 {
         .as_secs() as u32
 }
 
-#[derive(Debug, Clone, Deserialize)]
+fn now_millis() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before unix epoch")?
+        .as_millis() as u64)
+}
+
+struct RuntimeState {
+    wallet: EverWallet,
+    validation: RuntimeValidation,
+}
+
+impl RuntimeState {
+    fn new(transport: &Transport, app: &AppConfig) -> Result<Self> {
+        match &app.validation {
+            ValidationConfig::Simple(simple) => {
+                let loaded = simple.wallet.load(app.elections_path.as_ref())?;
+                let wallet = EverWallet::with_workchain(transport, loaded.keys, MASTERCHAIN)?;
+                if wallet.address().to_string() != loaded.address {
+                    bail!(
+                        "wallet address mismatch: config has {}, derived {}",
+                        loaded.address,
+                        wallet.address()
+                    );
+                }
+
+                Ok(Self {
+                    wallet,
+                    validation: RuntimeValidation::Simple {
+                        stake: simple.stake.clone(),
+                        elections_stake: loaded.elections_stake,
+                    },
+                })
+            }
+            ValidationConfig::Depool(depool_config) => {
+                let loaded = depool_config.validator_wallet.load(BASECHAIN)?;
+                let wallet = EverWallet::with_workchain(transport, loaded.keys, BASECHAIN)?;
+                if wallet.address().to_string() != loaded.address {
+                    bail!(
+                        "validator wallet address mismatch: config has {}, derived {}",
+                        loaded.address,
+                        wallet.address()
+                    );
+                }
+
+                let runtime_config = DepoolRuntimeConfig::from_config(&depool_config.depool)?;
+                let depool = DePool::new(transport, runtime_config.address.clone())?;
+
+                Ok(Self {
+                    wallet,
+                    validation: RuntimeValidation::Depool {
+                        depool: Box::new(depool),
+                        config: runtime_config,
+                    },
+                })
+            }
+        }
+    }
+}
+
+enum RuntimeValidation {
+    Simple {
+        stake: StakeConfig,
+        elections_stake: Option<String>,
+    },
+    Depool {
+        depool: Box<DePool>,
+        config: DepoolRuntimeConfig,
+    },
+}
+
+impl RuntimeValidation {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Simple { .. } => "simple",
+            Self::Depool { .. } => "depool",
+        }
+    }
+}
+
+struct LoadedWallet {
+    keys: KeyPair,
+    address: String,
+    elections_stake: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 struct AppConfig {
     endpoint: String,
     node_keys_path: PathBuf,
-    elections_path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    elections_path: Option<PathBuf>,
     send: bool,
     once: bool,
     retry: usize,
@@ -492,15 +1129,16 @@ struct AppConfig {
     confirmation_interval_secs: u64,
     poll_interval_secs: u64,
     error_retry_interval_secs: u64,
+    validation: ValidationConfig,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
         Self {
-            endpoint: "https://rpc-testnet.tychoprotocol.com".to_owned(),
+            endpoint: DEFAULT_ENDPOINT.to_owned(),
             node_keys_path: PathBuf::from(format!("{home}/.tycho/node_keys.json")),
-            elections_path: PathBuf::from(format!("{home}/.tycho/elections.json")),
+            elections_path: None,
             send: false,
             once: false,
             retry: 3,
@@ -509,6 +1147,7 @@ impl Default for AppConfig {
             confirmation_interval_secs: 3,
             poll_interval_secs: 60,
             error_retry_interval_secs: 30,
+            validation: ValidationConfig::default(),
         }
     }
 }
@@ -517,10 +1156,10 @@ impl AppConfig {
     fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
         if !path.exists() {
-            let default = Self::default();
-            write_default_config_if_missing(path)?;
-            log_info(format!("created default config {}", path.display()));
-            return Ok(default);
+            bail!(
+                "config {} does not exist; run `ever-elect init` first",
+                path.display()
+            );
         }
 
         let data = fs::read_to_string(path)
@@ -541,21 +1180,248 @@ impl AppConfig {
     }
 }
 
-#[derive(serde::Serialize)]
-struct AppConfigTemplate<'a> {
-    endpoint: &'a str,
-    node_keys_path: &'a str,
-    elections_path: &'a str,
-    send: bool,
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ValidationConfig {
+    Simple(SimpleValidationConfig),
+    Depool(DepoolValidationConfig),
 }
 
-fn default_template() -> AppConfigTemplate<'static> {
-    AppConfigTemplate {
-        endpoint: "https://rpc-testnet.tychoprotocol.com",
-        node_keys_path: "~/.tycho/node_keys.json",
-        elections_path: "~/.tycho/elections.json",
-        send: false,
+impl Default for ValidationConfig {
+    fn default() -> Self {
+        Self::Simple(SimpleValidationConfig::default())
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+struct SimpleValidationConfig {
+    wallet: SimpleWalletConfig,
+    stake: StakeConfig,
+}
+
+impl Default for SimpleValidationConfig {
+    fn default() -> Self {
+        Self {
+            wallet: SimpleWalletConfig::default(),
+            stake: StakeConfig::FromElectionsJson,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+enum SimpleWalletConfig {
+    ElectionsJson { path: Option<PathBuf> },
+    Stored { wallet: StoredWalletConfig },
+}
+
+impl Default for SimpleWalletConfig {
+    fn default() -> Self {
+        Self::ElectionsJson { path: None }
+    }
+}
+
+impl SimpleWalletConfig {
+    fn load(&self, legacy_path: Option<&PathBuf>) -> Result<LoadedWallet> {
+        match self {
+            Self::ElectionsJson { path } => {
+                let path = path
+                    .as_ref()
+                    .or(legacy_path)
+                    .cloned()
+                    .unwrap_or_else(default_elections_path);
+                let elections = ElectionsFile::load(path)?;
+                let keys = KeyPair::from_secret_hex(&elections.wallet_secret)
+                    .context("invalid wallet secret")?;
+
+                if keys.public_key_hex() != elections.wallet_public {
+                    bail!("wallet public key does not match wallet secret");
+                }
+
+                ensure_workchain(&elections.wallet_address, MASTERCHAIN)?;
+
+                Ok(LoadedWallet {
+                    keys,
+                    address: elections.wallet_address,
+                    elections_stake: Some(elections.stake),
+                })
+            }
+            Self::Stored { wallet } => {
+                let loaded = wallet.load(MASTERCHAIN)?;
+                Ok(LoadedWallet {
+                    keys: loaded.keys,
+                    address: loaded.address,
+                    elections_stake: None,
+                })
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum StakeConfig {
+    FromElectionsJson,
+    Fixed { amount: String },
+    Float { keep_wallet_balance: String },
+}
+
+impl StakeConfig {
+    fn stake_nano(
+        &self,
+        wallet_balance: u128,
+        elector_gas: u128,
+        elections_stake: Option<&str>,
+    ) -> Result<u128> {
+        match self {
+            Self::FromElectionsJson => {
+                let stake =
+                    elections_stake.context("stake is not available from elections.json")?;
+                parse_tokens_to_nano(stake)
+            }
+            Self::Fixed { amount } => parse_tokens_to_nano(amount),
+            Self::Float {
+                keep_wallet_balance,
+            } => {
+                let keep = parse_tokens_to_nano(keep_wallet_balance)?;
+                wallet_balance
+                    .checked_sub(keep.saturating_add(elector_gas))
+                    .context("wallet balance is too low for floating stake")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct DepoolValidationConfig {
+    validator_wallet: StoredWalletConfig,
+    depool: DepoolConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+enum DepoolConfig {
+    New(NewDepoolConfig),
+    Existing { address: String },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct NewDepoolConfig {
+    address: String,
+    seed: Option<String>,
+    public: String,
+    secret: String,
+    min_stake: String,
+    validator_assurance: String,
+    participant_reward_fraction: u8,
+}
+
+impl NewDepoolConfig {
+    fn min_stake_nano(&self) -> Result<u128> {
+        parse_tokens_to_nano(&self.min_stake)
+    }
+
+    fn validator_assurance_nano(&self) -> Result<u128> {
+        parse_tokens_to_nano(&self.validator_assurance)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DepoolRuntimeConfig {
+    address: String,
+    new: Option<NewDepoolConfig>,
+}
+
+impl DepoolRuntimeConfig {
+    fn from_config(config: &DepoolConfig) -> Result<Self> {
+        match config {
+            DepoolConfig::New(new) => {
+                ensure_workchain(&new.address, BASECHAIN)?;
+                let keys = KeyPair::from_secret_hex(&new.secret)
+                    .context("invalid DePool deployment secret")?;
+                if keys.public_key_hex() != new.public {
+                    bail!("DePool public key does not match secret");
+                }
+                let expected = DePool::compute_address(BASECHAIN, &keys)?;
+                if expected.to_string() != new.address {
+                    bail!(
+                        "DePool address mismatch: config has {}, derived {}",
+                        new.address,
+                        expected
+                    );
+                }
+
+                Ok(Self {
+                    address: new.address.clone(),
+                    new: Some(new.clone()),
+                })
+            }
+            DepoolConfig::Existing { address } => {
+                ensure_workchain(address, BASECHAIN)?;
+                Ok(Self {
+                    address: address.clone(),
+                    new: None,
+                })
+            }
+        }
+    }
+
+    fn new_validator_assurance_nano(&self) -> Result<u64> {
+        let Some(new) = &self.new else {
+            return Ok(0);
+        };
+        let assurance = new.validator_assurance_nano()?;
+        u64::try_from(assurance).context("validator assurance does not fit uint64")
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct StoredWalletConfig {
+    address: String,
+    seed: Option<String>,
+    public: String,
+    secret: String,
+}
+
+impl StoredWalletConfig {
+    fn from_seed(seed: &str, workchain: i8) -> Result<Self> {
+        let keys = KeyPair::from_seed(seed)?;
+        let address = EverWallet::compute_address(workchain, keys.public_key())?.to_string();
+
+        Ok(Self {
+            address,
+            seed: Some(seed.to_owned()),
+            public: keys.public_key_hex(),
+            secret: keys.secret_key_hex(),
+        })
+    }
+
+    fn load(&self, workchain: i8) -> Result<LoadedStoredWallet> {
+        ensure_workchain(&self.address, workchain)?;
+        let keys = KeyPair::from_secret_hex(&self.secret).context("invalid wallet secret")?;
+        if keys.public_key_hex() != self.public {
+            bail!("wallet public key does not match wallet secret");
+        }
+        let expected = EverWallet::compute_address(workchain, keys.public_key())?;
+        if expected.to_string() != self.address {
+            bail!(
+                "wallet address mismatch: config has {}, derived {}",
+                self.address,
+                expected
+            );
+        }
+
+        Ok(LoadedStoredWallet {
+            keys,
+            address: self.address.clone(),
+        })
+    }
+}
+
+struct LoadedStoredWallet {
+    keys: KeyPair,
+    address: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -596,14 +1462,50 @@ impl ElectionsFile {
         this.stake = this.stake.trim().to_owned();
         Ok(this)
     }
+}
 
-    fn stake_nano(&self) -> Result<u128> {
-        self.stake
-            .parse::<u128>()
-            .context("elections stake must be an integer token amount")?
-            .checked_mul(ONE_TOKEN)
-            .context("elections stake is too large")
+fn ensure_workchain(address: &str, workchain: i8) -> Result<StdAddr> {
+    let address = parse_std_addr(address)?;
+    if address.workchain != workchain {
+        bail!(
+            "address {} must be in workchain {}, got {}",
+            address,
+            workchain,
+            address.workchain
+        );
     }
+    Ok(address)
+}
+
+fn parse_tokens_to_nano(value: &str) -> Result<u128> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("amount is empty");
+    }
+
+    let (whole, frac) = value.split_once('.').unwrap_or((value, ""));
+    let whole = whole
+        .parse::<u128>()
+        .with_context(|| format!("invalid whole token amount `{whole}`"))?;
+    if frac.len() > 9 {
+        bail!("token amount has more than 9 decimal places");
+    }
+    let mut frac_padded = frac.to_owned();
+    while frac_padded.len() < 9 {
+        frac_padded.push('0');
+    }
+    let frac = if frac_padded.is_empty() {
+        0
+    } else {
+        frac_padded
+            .parse::<u128>()
+            .with_context(|| format!("invalid fractional token amount `{frac}`"))?
+    };
+
+    whole
+        .checked_mul(ONE_TOKEN)
+        .and_then(|whole| whole.checked_add(frac))
+        .context("token amount is too large")
 }
 
 fn expand_home(path: &Path) -> PathBuf {
@@ -611,10 +1513,10 @@ fn expand_home(path: &Path) -> PathBuf {
         return path.to_owned();
     };
 
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return PathBuf::from(home).join(rest);
     }
 
     PathBuf::from(path)
