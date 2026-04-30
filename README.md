@@ -13,119 +13,49 @@ git clone https://github.com/jouliene/ever-elect.git
 cd ever-elect
 ./install.sh
 source "$HOME/.cargo/env"
-ever-elect init
 ```
 
-The installer installs Rust with `rustup` when `cargo` is missing, then builds
-the release binary and copies it to:
-
-```text
-~/.cargo/bin/ever-elect
-```
-
-Before building, it refreshes the `minik2` git dependency so installs track the
-latest `jouliene/minik2` main branch instead of staying on an old lockfile
-revision.
-
-Make sure `~/.cargo/bin` is in `PATH`.
+The installer installs `rustup` when needed, updates the Rust stable toolchain,
+refreshes `minik2`, builds the release binary, and installs it to
+`~/.cargo/bin/ever-elect`.
 
 ## Init
+
+Initialize the Tycho node first if `~/.tycho/node_keys.json` does not exist:
+
+```bash
+tycho node init
+```
+
+Then create the ever-elect config:
 
 ```bash
 ever-elect init
 ```
 
-This asks for:
-
-- endpoint, defaulting to `https://rpc-testnet.tychoprotocol.com`
-- Tycho config folder, defaulting to `~/.tycho`
-- validation mode: simple or DePool
-- wallet creation/restoration details
-- stake policy for simple validation
-- DePool deployment or existing DePool details for DePool validation
-
-The config folder must already contain `node_keys.json`; initialize the node
-first with `tycho node init`.
-
-`init` creates:
-
-```text
-~/.tycho/ever-elect.json
-~/.config/systemd/user/ever-elect.service
-```
-
-Simple validation config shape:
-
-```json
-{
-  "endpoint": "https://rpc-testnet.tychoprotocol.com",
-  "node_keys_path": "~/.tycho/node_keys.json",
-  "send": false,
-  "validation": {
-    "type": "simple",
-    "wallet": {
-      "source": "elections_json",
-      "path": "~/.tycho/elections.json"
-    },
-    "stake": {
-      "type": "fixed",
-      "amount": "500000"
-    }
-  }
-}
-```
-
-DePool validation config uses a workchain `0` validator wallet and either an
-existing workchain `0` DePool address or a stored DePool deployment plan. Set
-`send` to `true` only after checking the endpoint, node key, wallet, DePool, and
-stake/deployment settings.
-
-Runtime timings, retry counts, DePool request value, and DePool wallet reserve
-use built-in defaults and are intentionally not emitted in `ever-elect.json`.
-The DePool request value is gas/change, not the stake; the stake is added
-earlier with `addOrdinaryStake` and DePool forwards the ready round stake
-through its proxy.
-
-Ordinary DePool stake is tracked per round. During the open elections window,
-ever-elect checks the current pooling side, following nodekeeper's
-`pooling + previous` accounting, and only adds the missing validator assurance
-for that side instead of trusting the participant total across all rounds.
-
-ever-elect also maintains DePool infrastructure balances before election
-handling. The DePool own balance is topped back to `30` TYCHO with
-`receiveFunds` when it drops below `20` TYCHO, and each proxy is topped to `5`
-TYCHO when it drops below `3` TYCHO.
+Follow the prompts. This writes `~/.tycho/ever-elect.json` and
+`~/.config/systemd/user/ever-elect.service`.
 
 ## Run
-
-Manual run:
 
 ```bash
 ever-elect run
 ```
 
-User service:
+## Service
 
 ```bash
 systemctl --user start ever-elect.service
 journalctl --user -u ever-elect.service -f
 ```
 
-Enable service autostart:
+Enable autostart:
 
 ```bash
 systemctl --user enable ever-elect.service
 ```
 
-On a server without an active user systemd bus, `init` will still write the
-service file but `systemctl --user` may fail. You can run manually with:
-
-```bash
-ever-elect run ~/.tycho/ever-elect.json
-```
-
-To use the user service on such hosts, enable lingering and start a fresh user
-session:
+If user systemd is not available on the server:
 
 ```bash
 sudo loginctl enable-linger "$USER"

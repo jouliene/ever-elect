@@ -3,31 +3,43 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-ensure_cargo() {
+ensure_rust() {
     if [ -f "$HOME/.cargo/env" ]; then
         # shellcheck disable=SC1091
         . "$HOME/.cargo/env"
     fi
 
-    if command -v cargo >/dev/null 2>&1; then
-        return
+    if ! command -v rustup >/dev/null 2>&1; then
+        if ! command -v curl >/dev/null 2>&1; then
+            echo "rustup is not installed and curl is required to install/update Rust" >&2
+            echo "install curl first, then rerun ./install.sh" >&2
+            exit 1
+        fi
+
+        echo "rustup not found; installing Rust stable with rustup..."
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+
+        # shellcheck disable=SC1091
+        . "$HOME/.cargo/env"
     fi
 
-    if ! command -v curl >/dev/null 2>&1; then
-        echo "cargo is not installed and curl is required to install Rust with rustup" >&2
-        echo "install curl first, then rerun ./install.sh" >&2
+    echo "updating Rust stable toolchain..."
+    rustup update stable
+    rustup default stable
+
+    if [ -f "$HOME/.cargo/env" ]; then
+        # shellcheck disable=SC1091
+        . "$HOME/.cargo/env"
+    fi
+
+    if ! command -v cargo >/dev/null 2>&1; then
+        echo "cargo is not available after installing/updating Rust" >&2
         exit 1
     fi
-
-    echo "cargo not found; installing Rust with rustup..."
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --profile minimal
-
-    # shellcheck disable=SC1091
-    . "$HOME/.cargo/env"
 }
 
-ensure_cargo
+ensure_rust
 
 cargo update -p minik2
 cargo build --release
