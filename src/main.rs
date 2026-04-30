@@ -18,10 +18,14 @@ const BASECHAIN: i8 = 0;
 const DEFAULT_DEPOOL_PARTICIPATE_VALUE: &str = "5";
 const DEFAULT_DEPOOL_WALLET_RESERVE: &str = "20";
 const DEPOOL_ROUND_STEP_WAITING_VALIDATOR_REQUEST: u8 = 2;
+const DEPOOL_COMPLETION_REASON_FAKE_ROUND: u8 = 2;
 const DEPOOL_MIN_BALANCE: u128 = 20 * ONE_TOKEN;
 const DEPOOL_TARGET_BALANCE: u128 = 30 * ONE_TOKEN;
 const DEPOOL_PROXY_MIN_BALANCE: u128 = 3 * ONE_TOKEN;
 const DEPOOL_PROXY_TARGET_BALANCE: u128 = 5 * ONE_TOKEN;
+const DEPOOL_UPDATE_ATTEMPTS: usize = 4;
+const DEPOOL_TICKTOCK_VALUE: u128 = ONE_TOKEN;
+const DEPOOL_TICKTOCK_INTERVAL_SECS: u64 = 60;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -763,25 +767,25 @@ async fn run_depool_election(
         return Ok(boundary_wait_secs(until_elections_end));
     }
 
-    depool.update().await?;
-    if app.send {
-        let receipt = depool.ticktock(wallet).await?;
-        log_info(format!("depool_ticktock_hash={}", receipt.message_hash));
-        depool.update().await?;
-        ensure_depool_round_stake(wallet, depool, depool_config, app).await?;
-    }
-
-    let required_stake = required_depool_stake(depool, depool_config)?;
-    let Some(ready_round) = select_ready_depool_round(depool, current.elect_at, required_stake)?
+    let Some(ready_round) =
+        update_depool_for_election(wallet, depool, depool_config, app, current.elect_at).await?
     else {
         log_info(format!(
-            "depool is not ready for election_id={}; waiting for a round with stake >= {}; rounds={}",
+            "depool is not ready for election_id={}; rounds={}",
             current.elect_at,
-            required_stake,
             format_depool_rounds(depool)
         ));
         return Ok(app.poll_interval());
     };
+
+    if ready_round.step != DEPOOL_ROUND_STEP_WAITING_VALIDATOR_REQUEST {
+        log_info(format!(
+            "depool target round is not waiting for validator request election_id={} round_id={} step={}",
+            current.elect_at, ready_round.id, ready_round.step
+        ));
+        return Ok(app.poll_interval());
+    }
+
     config.check_stake(ready_round.stake as u128)?;
     let participate_value = app.depool_participate_value_nano()?;
 
@@ -915,7 +919,7 @@ async fn prepare_depool(
         );
     }
 
-    ensure_depool_round_stake(wallet, depool, config, app).await
+    Ok(())
 }
 
 async fn maintain_depool_balance(
@@ -923,18 +927,19 @@ async fn maintain_depool_balance(
     depool: &mut DePool,
     app: &AppConfig,
 ) -> Result<()> {
-    if depool.account_balance >= DEPOOL_MIN_BALANCE {
+    if depool.own_balance >= DEPOOL_MIN_BALANCE as i128 {
         log_info(format!(
-            "depool_balance_ready depool={} balance={}",
-            depool.address, depool.account_balance
+            "depool_balance_ready depool={} own_balance={} account_balance={}",
+            depool.address, depool.own_balance, depool.account_balance
         ));
         return Ok(());
     }
 
-    let topup = DEPOOL_TARGET_BALANCE.saturating_sub(depool.account_balance);
+    let topup = u128::try_from(DEPOOL_TARGET_BALANCE as i128 - depool.own_balance)
+        .context("DePool own balance topup does not fit uint128")?;
     log_info(format!(
-        "depool_balance_low depool={} balance={} target={} topup={}",
-        depool.address, depool.account_balance, DEPOOL_TARGET_BALANCE, topup
+        "depool_balance_low depool={} own_balance={} account_balance={} target={} topup={}",
+        depool.address, depool.own_balance, depool.account_balance, DEPOOL_TARGET_BALANCE, topup
     ));
 
     if !app.send {
@@ -1047,6 +1052,109 @@ fn wallet_operation_reserve(app: &AppConfig) -> Result<u128> {
         .depool_wallet_reserve_nano()?
         .saturating_add(app.depool_participate_value_nano()?)
         .saturating_add(DEFAULT_DEPOOL_GAS))
+}
+
+async fn update_depool_for_election(
+    wallet: &mut EverWallet,
+    depool: &mut DePool,
+    config: &DepoolRuntimeConfig,
+    app: &AppConfig,
+    election_id: u32,
+) -> Result<Option<ReadyDePoolRound>> {
+    let mut sent_ticktock = false;
+
+    for attempt in 1..=DEPOOL_UPDATE_ATTEMPTS {
+        depool.update().await?;
+        ensure_depool_round_stake(wallet, depool, config, app).await?;
+        depool.update().await?;
+
+        let required_stake = required_depool_stake(depool, config)?;
+        let Some(target_round) = select_target_depool_round(depool, required_stake)? else {
+            log_info(format!(
+                "depool target round is not available depool={} attempt={} required={} rounds={}",
+                depool.address,
+                attempt,
+                required_stake,
+                format_depool_rounds(depool)
+            ));
+            return Ok(None);
+        };
+
+        log_info(format!(
+            "depool_target_round depool={} attempt={} election_id={} round_id={} step={} supposed_elected_at={} stake={} validator_stake={} completion_reason={}",
+            depool.address,
+            attempt,
+            election_id,
+            target_round.id,
+            target_round.step,
+            target_round.supposed_elected_at,
+            target_round.stake,
+            target_round.validator_stake,
+            target_round.completion_reason
+        ));
+
+        if target_round.supposed_elected_at == election_id {
+            return Ok(Some(target_round));
+        }
+
+        if sent_ticktock && target_round.completion_reason == DEPOOL_COMPLETION_REASON_FAKE_ROUND {
+            log_info(format!(
+                "depool target round is fake after ticktock depool={} round_id={}",
+                depool.address, target_round.id
+            ));
+            return Ok(None);
+        }
+
+        if attempt == DEPOOL_UPDATE_ATTEMPTS {
+            log_info(format!(
+                "failed to update DePool target round depool={} election_id={} rounds={}",
+                depool.address,
+                election_id,
+                format_depool_rounds(depool)
+            ));
+            return Ok(None);
+        }
+
+        if !app.send {
+            log_info("dry run enabled; skipping DePool ticktock");
+            return Ok(None);
+        }
+
+        wallet.update().await?;
+        if !wallet_can_spend(wallet, app, DEPOOL_TICKTOCK_VALUE)? {
+            log_info(format!(
+                "wallet balance is too low for DePool ticktock balance={} value={} reserve={}",
+                wallet.balance(),
+                DEPOOL_TICKTOCK_VALUE,
+                wallet_operation_reserve(app)?
+            ));
+            return Ok(None);
+        }
+
+        log_info(format!(
+            "depool_ticktock depool={} value={} attempt={}",
+            depool.address, DEPOOL_TICKTOCK_VALUE, attempt
+        ));
+        match send_depool_ticktock_request(depool, wallet, app, DEPOOL_TICKTOCK_VALUE).await {
+            Ok(receipt) => {
+                log_info(format!(
+                    "depool_ticktock_success depool={} value={} hash={}",
+                    depool.address, DEPOOL_TICKTOCK_VALUE, receipt.message_hash
+                ));
+            }
+            Err(e) => {
+                log_error(format!(
+                    "depool_ticktock_failed depool={} value={} error={e:#}",
+                    depool.address, DEPOOL_TICKTOCK_VALUE
+                ));
+                return Err(e);
+            }
+        }
+        sent_ticktock = true;
+        sleep(Duration::from_secs(DEPOOL_TICKTOCK_INTERVAL_SECS)).await;
+    }
+
+    Ok(None)
 }
 
 async fn ensure_depool_round_stake(
@@ -1259,6 +1367,26 @@ async fn send_depool_participate_request(
         .await
 }
 
+async fn send_depool_ticktock_request(
+    depool: &DePool,
+    wallet: &mut EverWallet,
+    app: &AppConfig,
+    value: u128,
+) -> Result<SendReceipt> {
+    let payload = build_ticktock_payload()?;
+
+    wallet
+        .send_transaction_safe_with_retry(
+            &depool.address,
+            value,
+            true,
+            3,
+            Some(&payload),
+            app.retry,
+        )
+        .await
+}
+
 async fn confirm_simple_participation(
     elector: &Elector,
     validator_key: &HashBytes,
@@ -1382,40 +1510,41 @@ async fn send_elector_message(
 struct ReadyDePoolRound {
     id: u64,
     step: u8,
+    completion_reason: u8,
     supposed_elected_at: u32,
     proxy: StdAddr,
     stake: u64,
     validator_stake: u64,
 }
 
-fn select_ready_depool_round(
+fn select_target_depool_round(
     depool: &DePool,
-    election_id: u32,
     required_stake: u64,
 ) -> Result<Option<ReadyDePoolRound>> {
     if depool.proxies.is_empty() {
         bail!("DePool has no proxies");
     }
 
-    Ok(depool
-        .get_rounds()
-        .iter()
-        .find(|round| {
-            round.supposed_elected_at == election_id
-                && round.step == DEPOOL_ROUND_STEP_WAITING_VALIDATOR_REQUEST
-                && round.stake >= required_stake
-        })
-        .map(|round| {
-            let proxy = depool.proxies[(round.id as usize) % depool.proxies.len()].clone();
-            ReadyDePoolRound {
-                id: round.id,
-                step: round.step,
-                supposed_elected_at: round.supposed_elected_at,
-                proxy,
-                stake: round.stake,
-                validator_stake: round.validator_stake,
-            }
-        }))
+    let rounds = depool.get_rounds();
+    if rounds.len() < 3 {
+        return Ok(None);
+    }
+
+    let round = &rounds[1];
+    if round.stake < required_stake {
+        return Ok(None);
+    }
+
+    let proxy = depool.proxies[(round.id as usize) % depool.proxies.len()].clone();
+    Ok(Some(ReadyDePoolRound {
+        id: round.id,
+        step: round.step,
+        completion_reason: round.completion_reason,
+        supposed_elected_at: round.supposed_elected_at,
+        proxy,
+        stake: round.stake,
+        validator_stake: round.validator_stake,
+    }))
 }
 
 fn format_depool_rounds(depool: &DePool) -> String {

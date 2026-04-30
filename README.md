@@ -86,14 +86,15 @@ when ever-elect calculates the ordinary stake. The calculation also reserves the
 participate value and a small gas margin so the wallet is not drained by
 staking.
 
-Ordinary DePool stake is tracked per round. ever-elect checks the current
-pooling side, following nodekeeper's `pooling + previous` accounting, and only
-adds the missing validator assurance for that side instead of trusting the
-participant total across all rounds.
+Ordinary DePool stake is tracked per round. During the open elections window,
+ever-elect checks the current pooling side, following nodekeeper's
+`pooling + previous` accounting, and only adds the missing validator assurance
+for that side instead of trusting the participant total across all rounds.
 
 ever-elect also maintains DePool infrastructure balances before election
-handling. The DePool account is topped back to `30` TYCHO when it drops below
-`20` TYCHO, and each proxy is topped to `5` TYCHO when it drops below `3` TYCHO.
+handling. The DePool own balance is topped back to `30` TYCHO with
+`receiveFunds` when it drops below `20` TYCHO, and each proxy is topped to `5`
+TYCHO when it drops below `3` TYCHO.
 
 ## Run
 
