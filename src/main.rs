@@ -18,6 +18,8 @@ const BASECHAIN: i8 = 0;
 const DEFAULT_DEPOOL_PARTICIPATE_VALUE: &str = "5";
 const DEFAULT_DEPOOL_WALLET_RESERVE: &str = "20";
 const DEPOOL_ROUND_STEP_WAITING_VALIDATOR_REQUEST: u8 = 2;
+const DEPOOL_MIN_BALANCE: u128 = 20 * ONE_TOKEN;
+const DEPOOL_TARGET_BALANCE: u128 = 30 * ONE_TOKEN;
 const DEPOOL_PROXY_MIN_BALANCE: u128 = 3 * ONE_TOKEN;
 const DEPOOL_PROXY_TARGET_BALANCE: u128 = 5 * ONE_TOKEN;
 
@@ -858,17 +860,31 @@ async fn prepare_depool(
             return Ok(());
         }
 
-        let target_balance = MIN_BALANCE_FOR_DEPLOY + DEFAULT_DEPOOL_GAS;
+        let target_balance = DEPOOL_TARGET_BALANCE.max(MIN_BALANCE_FOR_DEPLOY + DEFAULT_DEPOOL_GAS);
         if depool.account_balance < target_balance {
             let topup = target_balance - depool.account_balance;
             log_info(format!(
-                "topping_up_depool address={} value={topup}",
-                depool.address
+                "depool_deploy_topup depool={} balance={} target={} topup={}",
+                depool.address, depool.account_balance, target_balance, topup
             ));
-            let receipt = wallet
+            match wallet
                 .send_transaction_safe_with_retry(&depool.address, topup, false, 3, None, app.retry)
-                .await?;
-            log_info(format!("depool_topup_hash={}", receipt.message_hash));
+                .await
+            {
+                Ok(receipt) => {
+                    log_info(format!(
+                        "depool_deploy_topup_success depool={} value={} hash={}",
+                        depool.address, topup, receipt.message_hash
+                    ));
+                }
+                Err(e) => {
+                    log_error(format!(
+                        "depool_deploy_topup_failed depool={} value={} error={e:#}",
+                        depool.address, topup
+                    ));
+                    return Err(e);
+                }
+            }
             depool.update().await?;
         }
 
@@ -886,6 +902,7 @@ async fn prepare_depool(
         depool.update().await?;
     }
 
+    maintain_depool_balance(wallet, depool, app).await?;
     maintain_depool_proxy_balances(transport, wallet, depool, app).await?;
 
     if let Some(validator_wallet) = &depool.validator_wallet
@@ -899,6 +916,60 @@ async fn prepare_depool(
     }
 
     ensure_depool_round_stake(wallet, depool, config, app).await
+}
+
+async fn maintain_depool_balance(
+    wallet: &mut EverWallet,
+    depool: &mut DePool,
+    app: &AppConfig,
+) -> Result<()> {
+    if depool.account_balance >= DEPOOL_MIN_BALANCE {
+        log_info(format!(
+            "depool_balance_ready depool={} balance={}",
+            depool.address, depool.account_balance
+        ));
+        return Ok(());
+    }
+
+    let topup = DEPOOL_TARGET_BALANCE.saturating_sub(depool.account_balance);
+    log_info(format!(
+        "depool_balance_low depool={} balance={} target={} topup={}",
+        depool.address, depool.account_balance, DEPOOL_TARGET_BALANCE, topup
+    ));
+
+    if !app.send {
+        log_info("dry run enabled; skipping DePool balance topup");
+        return Ok(());
+    }
+
+    wallet.update().await?;
+    if !wallet_can_spend(wallet, app, topup)? {
+        log_info(format!(
+            "wallet balance is too low for DePool balance topup balance={} topup={} reserve={}",
+            wallet.balance(),
+            topup,
+            wallet_operation_reserve(app)?
+        ));
+        return Ok(());
+    }
+
+    match depool.receive_funds(wallet, topup).await {
+        Ok(receipt) => {
+            log_info(format!(
+                "depool_balance_topup_success depool={} value={} hash={}",
+                depool.address, topup, receipt.message_hash
+            ));
+            depool.update().await?;
+            Ok(())
+        }
+        Err(e) => {
+            log_error(format!(
+                "depool_balance_topup_failed depool={} value={} error={e:#}",
+                depool.address, topup
+            ));
+            Err(e)
+        }
+    }
 }
 
 async fn maintain_depool_proxy_balances(
@@ -916,16 +987,16 @@ async fn maintain_depool_proxy_balances(
         let proxy_balance = account_balance(transport, proxy).await?;
         if proxy_balance >= DEPOOL_PROXY_MIN_BALANCE {
             log_info(format!(
-                "depool_proxy_balance_ready proxy={} balance={}",
-                proxy, proxy_balance
+                "depool_proxy_balance_ready depool={} proxy={} balance={}",
+                depool.address, proxy, proxy_balance
             ));
             continue;
         }
 
         let topup = DEPOOL_PROXY_TARGET_BALANCE.saturating_sub(proxy_balance);
         log_info(format!(
-            "depool_proxy_balance_low proxy={} balance={} target={} topup={}",
-            proxy, proxy_balance, DEPOOL_PROXY_TARGET_BALANCE, topup
+            "depool_proxy_balance_low depool={} proxy={} balance={} target={} topup={}",
+            depool.address, proxy, proxy_balance, DEPOOL_PROXY_TARGET_BALANCE, topup
         ));
 
         if !app.send {
@@ -934,30 +1005,48 @@ async fn maintain_depool_proxy_balances(
         }
 
         wallet.update().await?;
-        let reserve = app
-            .depool_wallet_reserve_nano()?
-            .saturating_add(app.depool_participate_value_nano()?)
-            .saturating_add(DEFAULT_DEPOOL_GAS);
-        if wallet.balance() <= topup.saturating_add(reserve) {
+        if !wallet_can_spend(wallet, app, topup)? {
             log_info(format!(
                 "wallet balance is too low for DePool proxy topup balance={} topup={} reserve={}",
                 wallet.balance(),
                 topup,
-                reserve
+                wallet_operation_reserve(app)?
             ));
             continue;
         }
 
-        let receipt = wallet
+        match wallet
             .send_transaction_safe_with_retry(proxy, topup, false, 3, None, app.retry)
-            .await?;
-        log_info(format!(
-            "depool_proxy_topup_hash={} proxy={} value={}",
-            receipt.message_hash, proxy, topup
-        ));
+            .await
+        {
+            Ok(receipt) => {
+                log_info(format!(
+                    "depool_proxy_topup_success depool={} proxy={} value={} hash={}",
+                    depool.address, proxy, topup, receipt.message_hash
+                ));
+            }
+            Err(e) => {
+                log_error(format!(
+                    "depool_proxy_topup_failed depool={} proxy={} value={} error={e:#}",
+                    depool.address, proxy, topup
+                ));
+                return Err(e);
+            }
+        }
     }
 
     Ok(())
+}
+
+fn wallet_can_spend(wallet: &EverWallet, app: &AppConfig, value: u128) -> Result<bool> {
+    Ok(wallet.balance() > value.saturating_add(wallet_operation_reserve(app)?))
+}
+
+fn wallet_operation_reserve(app: &AppConfig) -> Result<u128> {
+    Ok(app
+        .depool_wallet_reserve_nano()?
+        .saturating_add(app.depool_participate_value_nano()?)
+        .saturating_add(DEFAULT_DEPOOL_GAS))
 }
 
 async fn ensure_depool_round_stake(
@@ -1026,14 +1115,29 @@ async fn ensure_depool_round_stake(
     }
 
     log_info(format!(
-        "depool_add_stake stake={} message_value={}",
+        "depool_add_stake depool={} stake={} message_value={} target_rounds={}",
+        depool.address,
         stake_to_add,
-        stake_to_add + DEFAULT_DEPOOL_GAS
+        stake_to_add + DEFAULT_DEPOOL_GAS,
+        round_stake.rounds_label
     ));
-    let receipt = depool.add_ordinary_stake(wallet, stake_to_add).await?;
-    log_info(format!("depool_add_stake_hash={}", receipt.message_hash));
-    depool.update().await?;
-    Ok(())
+    match depool.add_ordinary_stake(wallet, stake_to_add).await {
+        Ok(receipt) => {
+            log_info(format!(
+                "depool_add_stake_success depool={} stake={} hash={}",
+                depool.address, stake_to_add, receipt.message_hash
+            ));
+            depool.update().await?;
+            Ok(())
+        }
+        Err(e) => {
+            log_error(format!(
+                "depool_add_stake_failed depool={} stake={} error={e:#}",
+                depool.address, stake_to_add
+            ));
+            Err(e)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1871,5 +1975,5 @@ fn log_error(message: impl AsRef<str>) {
 }
 
 fn log(level: &str, message: &str) {
-    println!("{level} ever-elect: {message}");
+    println!("{level}: {message}");
 }

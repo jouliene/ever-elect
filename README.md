@@ -91,8 +91,9 @@ pooling side, following nodekeeper's `pooling + previous` accounting, and only
 adds the missing validator assurance for that side instead of trusting the
 participant total across all rounds.
 
-ever-elect also maintains the two DePool proxy balances. If a proxy drops below
-`3` TYCHO, it tops the proxy up to `5` TYCHO before election handling.
+ever-elect also maintains DePool infrastructure balances before election
+handling. The DePool account is topped back to `30` TYCHO when it drops below
+`20` TYCHO, and each proxy is topped to `5` TYCHO when it drops below `3` TYCHO.
 
 ## Run
 
