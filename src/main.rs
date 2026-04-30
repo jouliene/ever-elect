@@ -16,6 +16,7 @@ const ONE_TOKEN: u128 = 1_000_000_000;
 const MASTERCHAIN: i8 = -1;
 const BASECHAIN: i8 = 0;
 const DEFAULT_DEPOOL_PARTICIPATE_VALUE: &str = "5";
+const DEFAULT_DEPOOL_WALLET_RESERVE: &str = "20";
 const DEPOOL_ROUND_STEP_WAITING_VALIDATOR_REQUEST: u8 = 2;
 
 #[tokio::main]
@@ -908,18 +909,26 @@ async fn prepare_depool(
     }
 
     wallet.update().await?;
-    let Some(stake) = depool_available_stake(wallet.balance()) else {
+    let Some(stake_budget) = depool_available_stake(wallet.balance(), app)? else {
         log_info(format!(
-            "wallet balance is too low for DePool staking balance={} required={}",
+            "wallet balance is too low for DePool staking balance={} required={} wallet_reserve={} participate_reserve={} gas_reserve={}",
             wallet.balance(),
-            required
+            required,
+            app.depool_wallet_reserve_nano()?,
+            app.depool_participate_value_nano()?,
+            DEFAULT_DEPOOL_GAS
         ));
         return Ok(());
     };
 
     log_info(format!(
-        "depool_validator_stake_missing current={} required={} available_stake={}",
-        participant_stake, required, stake
+        "depool_validator_stake_missing current={} required={} available_stake={} wallet_reserve={} participate_reserve={} gas_reserve={}",
+        participant_stake,
+        required,
+        stake_budget.stake,
+        stake_budget.wallet_reserve,
+        stake_budget.participate_reserve,
+        stake_budget.gas_reserve
     ));
 
     if !app.send {
@@ -929,18 +938,40 @@ async fn prepare_depool(
 
     log_info(format!(
         "depool_add_stake stake={} message_value={}",
-        stake,
-        stake + DEFAULT_DEPOOL_GAS
+        stake_budget.stake,
+        stake_budget.stake + DEFAULT_DEPOOL_GAS
     ));
-    let receipt = depool.add_ordinary_stake(wallet, stake).await?;
+    let receipt = depool
+        .add_ordinary_stake(wallet, stake_budget.stake)
+        .await?;
     log_info(format!("depool_add_stake_hash={}", receipt.message_hash));
     depool.update().await?;
     Ok(())
 }
 
-fn depool_available_stake(balance: u128) -> Option<u128> {
-    let reserve = DEFAULT_DEPOOL_GAS.saturating_mul(2);
-    (balance > reserve).then_some(balance - reserve)
+#[derive(Debug, Clone, Copy)]
+struct DePoolStakeBudget {
+    stake: u128,
+    wallet_reserve: u128,
+    participate_reserve: u128,
+    gas_reserve: u128,
+}
+
+fn depool_available_stake(balance: u128, app: &AppConfig) -> Result<Option<DePoolStakeBudget>> {
+    let wallet_reserve = app.depool_wallet_reserve_nano()?;
+    let participate_reserve = app.depool_participate_value_nano()?;
+    let gas_reserve = DEFAULT_DEPOOL_GAS;
+    let total_reserve = wallet_reserve
+        .saturating_add(participate_reserve)
+        .saturating_add(gas_reserve)
+        .saturating_add(DEFAULT_DEPOOL_GAS);
+
+    Ok((balance > total_reserve).then_some(DePoolStakeBudget {
+        stake: balance - total_reserve,
+        wallet_reserve,
+        participate_reserve,
+        gas_reserve,
+    }))
 }
 
 fn required_depool_validator_stake(depool: &DePool, config: &DepoolRuntimeConfig) -> Result<u64> {
@@ -1271,6 +1302,7 @@ struct AppConfig {
     retry: usize,
     stake_factor: Option<u32>,
     depool_participate_value: String,
+    depool_wallet_reserve: String,
     confirmation_attempts: usize,
     confirmation_interval_secs: u64,
     poll_interval_secs: u64,
@@ -1290,6 +1322,7 @@ impl Default for AppConfig {
             retry: 3,
             stake_factor: None,
             depool_participate_value: DEFAULT_DEPOOL_PARTICIPATE_VALUE.to_owned(),
+            depool_wallet_reserve: DEFAULT_DEPOOL_WALLET_RESERVE.to_owned(),
             confirmation_attempts: 20,
             confirmation_interval_secs: 3,
             poll_interval_secs: 60,
@@ -1330,6 +1363,14 @@ impl AppConfig {
         let value = parse_tokens_to_nano(&self.depool_participate_value)?;
         if value == 0 {
             bail!("depool_participate_value must be greater than zero");
+        }
+        Ok(value)
+    }
+
+    fn depool_wallet_reserve_nano(&self) -> Result<u128> {
+        let value = parse_tokens_to_nano(&self.depool_wallet_reserve)?;
+        if value == 0 {
+            bail!("depool_wallet_reserve must be greater than zero");
         }
         Ok(value)
     }

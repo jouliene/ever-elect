@@ -81,6 +81,11 @@ attached to the validator request sent to DePool. It is gas/change, not the
 stake; the stake is added earlier with `addOrdinaryStake` and DePool forwards
 the ready round stake through its proxy.
 
+`depool_wallet_reserve` defaults to `20` and is kept on the validator wallet
+when ever-elect calculates the ordinary stake. The calculation also reserves the
+participate value and a small gas margin so the wallet is not drained by
+staking.
+
 ## Run
 
 Manual run:
