@@ -15,6 +15,7 @@ const DEFAULT_CONFIG_FOLDER: &str = "~/.tycho";
 const ONE_TOKEN: u128 = 1_000_000_000;
 const MASTERCHAIN: i8 = -1;
 const BASECHAIN: i8 = 0;
+const DEPOOL_ROUND_STEP_WAITING_VALIDATOR_REQUEST: u8 = 2;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -763,7 +764,15 @@ async fn run_depool_election(
         depool.update().await?;
     }
 
-    let proxy = select_depool_proxy(depool, current.elect_at)?;
+    let Some((round_id, proxy)) = select_ready_depool_round(depool, current.elect_at)? else {
+        log_info(format!(
+            "depool is not ready for election_id={}; waiting for a round in WaitingValidatorRequest; rounds={}",
+            current.elect_at,
+            format_depool_rounds(depool)
+        ));
+        return Ok(app.poll_interval());
+    };
+
     let stake_factor = config.compute_stake_factor(app.stake_factor)?;
     let adnl_addr = validator_key;
     let data_to_sign =
@@ -772,8 +781,14 @@ async fn run_depool_election(
     let signature = node_keys.sign(&data_to_sign).to_bytes();
 
     log_info(format!(
-        "prepared depool election request election_id={} elector_election_id={} until_end={} depool={} proxy={} stake_factor={}",
-        elections_end, current.elect_at, until_elections_end, depool.address, proxy, stake_factor
+        "prepared depool election request election_id={} elector_election_id={} until_end={} depool={} round_id={} proxy={} stake_factor={}",
+        elections_end,
+        current.elect_at,
+        until_elections_end,
+        depool.address,
+        round_id,
+        proxy,
+        stake_factor
     ));
 
     if !app.send {
@@ -1026,20 +1041,43 @@ async fn send_elector_message(
     Err(last_error.expect("attempts is never zero"))
 }
 
-fn select_depool_proxy(depool: &DePool, election_id: u32) -> Result<StdAddr> {
+fn select_ready_depool_round(depool: &DePool, election_id: u32) -> Result<Option<(u64, StdAddr)>> {
     if depool.proxies.is_empty() {
         bail!("DePool has no proxies");
     }
 
-    if let Some(round) = depool
+    Ok(depool
         .get_rounds()
         .iter()
-        .find(|round| round.supposed_elected_at == election_id)
-    {
-        return Ok(depool.proxies[(round.id as usize) % depool.proxies.len()].clone());
-    }
+        .find(|round| {
+            round.supposed_elected_at == election_id
+                && round.step == DEPOOL_ROUND_STEP_WAITING_VALIDATOR_REQUEST
+        })
+        .map(|round| {
+            (
+                round.id,
+                depool.proxies[(round.id as usize) % depool.proxies.len()].clone(),
+            )
+        }))
+}
 
-    Ok(depool.proxies[(election_id as usize) % depool.proxies.len()].clone())
+fn format_depool_rounds(depool: &DePool) -> String {
+    let rounds = depool
+        .get_rounds()
+        .iter()
+        .map(|round| {
+            format!(
+                "{{id={}, supposed_elected_at={}, step={}, stake={}, validator_stake={}}}",
+                round.id, round.supposed_elected_at, round.step, round.stake, round.validator_stake
+            )
+        })
+        .collect::<Vec<_>>();
+
+    if rounds.is_empty() {
+        "none".to_owned()
+    } else {
+        rounds.join(", ")
+    }
 }
 
 fn depool_has_source(depool: &DePool, source: &HashBytes) -> bool {
