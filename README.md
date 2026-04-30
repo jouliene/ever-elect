@@ -14,7 +14,9 @@ cargo build --release
 
 ## Config
 
-The default config file is `ever-elect.json`:
+The runtime config file is `ever-elect.json`. It is intentionally ignored by
+git because it is machine-local. `ever-elect.example.json` shows the default
+shape:
 
 ```json
 {
