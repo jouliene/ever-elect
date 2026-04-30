@@ -764,30 +764,42 @@ async fn run_depool_election(
         depool.update().await?;
     }
 
-    let Some((round_id, proxy)) = select_ready_depool_round(depool, current.elect_at)? else {
+    let required_validator_stake = required_depool_validator_stake(depool, depool_config)?;
+    let Some(ready_round) =
+        select_ready_depool_round(depool, current.elect_at, required_validator_stake)?
+    else {
         log_info(format!(
-            "depool is not ready for election_id={}; waiting for a round in WaitingValidatorRequest; rounds={}",
+            "depool is not ready for election_id={}; waiting for a round in WaitingValidatorRequest with validator_stake >= {}; rounds={}",
             current.elect_at,
+            required_validator_stake,
             format_depool_rounds(depool)
         ));
         return Ok(app.poll_interval());
     };
+    config.check_stake(ready_round.stake as u128)?;
 
     let stake_factor = config.compute_stake_factor(app.stake_factor)?;
     let adnl_addr = validator_key;
-    let data_to_sign =
-        build_elections_data_to_sign(current.elect_at, stake_factor, &proxy.address, &adnl_addr);
+    let data_to_sign = build_elections_data_to_sign(
+        current.elect_at,
+        stake_factor,
+        &ready_round.proxy.address,
+        &adnl_addr,
+    );
     let data_to_sign = config.signature_context()?.apply(&data_to_sign);
     let signature = node_keys.sign(&data_to_sign).to_bytes();
 
     log_info(format!(
-        "prepared depool election request election_id={} elector_election_id={} until_end={} depool={} round_id={} proxy={} stake_factor={}",
+        "prepared depool election request election_id={} elector_election_id={} until_end={} depool={} round_id={} proxy={} round_stake={} validator_stake={} participate_value={} stake_factor={}",
         elections_end,
         current.elect_at,
         until_elections_end,
         depool.address,
-        round_id,
-        proxy,
+        ready_round.id,
+        ready_round.proxy,
+        ready_round.stake,
+        ready_round.validator_stake,
+        DEFAULT_DEPOOL_GAS,
         stake_factor
     ));
 
@@ -911,6 +923,11 @@ async fn prepare_depool(
         return Ok(());
     }
 
+    log_info(format!(
+        "depool_add_stake stake={} message_value={}",
+        stake,
+        stake + DEFAULT_DEPOOL_GAS
+    ));
     let receipt = depool.add_ordinary_stake(wallet, stake).await?;
     log_info(format!("depool_add_stake_hash={}", receipt.message_hash));
     depool.update().await?;
@@ -920,6 +937,13 @@ async fn prepare_depool(
 fn depool_available_stake(balance: u128) -> Option<u128> {
     let reserve = DEFAULT_DEPOOL_GAS.saturating_mul(2);
     (balance > reserve).then_some(balance - reserve)
+}
+
+fn required_depool_validator_stake(depool: &DePool, config: &DepoolRuntimeConfig) -> Result<u64> {
+    Ok(depool
+        .validator_assurance
+        .max(depool.min_stake)
+        .max(config.new_validator_assurance_nano()?))
 }
 
 async fn confirm_simple_participation(
@@ -1041,7 +1065,19 @@ async fn send_elector_message(
     Err(last_error.expect("attempts is never zero"))
 }
 
-fn select_ready_depool_round(depool: &DePool, election_id: u32) -> Result<Option<(u64, StdAddr)>> {
+#[derive(Debug, Clone)]
+struct ReadyDePoolRound {
+    id: u64,
+    proxy: StdAddr,
+    stake: u64,
+    validator_stake: u64,
+}
+
+fn select_ready_depool_round(
+    depool: &DePool,
+    election_id: u32,
+    required_validator_stake: u64,
+) -> Result<Option<ReadyDePoolRound>> {
     if depool.proxies.is_empty() {
         bail!("DePool has no proxies");
     }
@@ -1052,12 +1088,16 @@ fn select_ready_depool_round(depool: &DePool, election_id: u32) -> Result<Option
         .find(|round| {
             round.supposed_elected_at == election_id
                 && round.step == DEPOOL_ROUND_STEP_WAITING_VALIDATOR_REQUEST
+                && round.validator_stake >= required_validator_stake
         })
         .map(|round| {
-            (
-                round.id,
-                depool.proxies[(round.id as usize) % depool.proxies.len()].clone(),
-            )
+            let proxy = depool.proxies[(round.id as usize) % depool.proxies.len()].clone();
+            ReadyDePoolRound {
+                id: round.id,
+                proxy,
+                stake: round.stake,
+                validator_stake: round.validator_stake,
+            }
         }))
 }
 
