@@ -240,11 +240,21 @@ fn init(config_path: PathBuf, explicit_path: bool) -> Result<()> {
         .with_context(|| format!("failed to write {}", service_path.display()))?;
     log_info(format!("wrote user service {}", service_path.display()));
 
-    reload_user_systemd();
-
-    log_info("start with: systemctl --user start ever-elect.service");
-    log_info("enable with: systemctl --user enable ever-elect.service");
-    log_info("logs with: journalctl --user -u ever-elect.service -f");
+    if reload_user_systemd() {
+        log_info("start with: systemctl --user start ever-elect.service");
+        log_info("enable with: systemctl --user enable ever-elect.service");
+        log_info("logs with: journalctl --user -u ever-elect.service -f");
+    } else {
+        log_info(format!(
+            "manual run: ever-elect run {}",
+            write_path.display()
+        ));
+        log_info("user systemd is not available in this session");
+        log_info("to use the service, enable lingering with: sudo loginctl enable-linger $USER");
+        log_info(
+            "then log out/in or start a proper user session and rerun: systemctl --user daemon-reload",
+        );
+    }
     Ok(())
 }
 
@@ -520,16 +530,35 @@ fn systemd_quote(path: &Path) -> String {
     format!("\"{escaped}\"")
 }
 
-fn reload_user_systemd() {
+fn reload_user_systemd() -> bool {
     match ProcessCommand::new("systemctl")
         .args(["--user", "daemon-reload"])
-        .status()
+        .output()
     {
-        Ok(status) if status.success() => log_info("reloaded user systemd manager"),
-        Ok(status) => log_error(format!(
-            "systemctl --user daemon-reload exited with {status}"
-        )),
-        Err(e) => log_error(format!("failed to run systemctl --user daemon-reload: {e}")),
+        Ok(output) if output.status.success() => {
+            log_info("reloaded user systemd manager");
+            true
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = stderr.trim();
+            if stderr.is_empty() {
+                log_error(format!(
+                    "systemctl --user daemon-reload exited with {}",
+                    output.status
+                ));
+            } else {
+                log_error(format!(
+                    "systemctl --user daemon-reload exited with {}: {}",
+                    output.status, stderr
+                ));
+            }
+            false
+        }
+        Err(e) => {
+            log_error(format!("failed to run systemctl --user daemon-reload: {e}"));
+            false
+        }
     }
 }
 

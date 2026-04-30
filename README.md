@@ -96,3 +96,18 @@ Enable service autostart:
 ```bash
 systemctl --user enable ever-elect.service
 ```
+
+On a server without an active user systemd bus, `init` will still write the
+service file but `systemctl --user` may fail. You can run manually with:
+
+```bash
+ever-elect run ~/.tycho/ever-elect.json
+```
+
+To use the user service on such hosts, enable lingering and start a fresh user
+session:
+
+```bash
+sudo loginctl enable-linger "$USER"
+systemctl --user daemon-reload
+```
