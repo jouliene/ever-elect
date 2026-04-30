@@ -226,25 +226,42 @@ async fn run_once(
             let receipt = send_elector_message(wallet, &config, &message, app.retry).await?;
             log_info(format!("participate_message_hash={}", receipt.message_hash));
 
-            let updated = elector.get_data().await?;
-            let current = updated
-                .current_election()
-                .context("elector has no current election after participation")?;
-            let member = current
-                .member(&validator_key)
-                .context("validator key is not registered after participation")?;
-            if member.src_addr != wallet.address().address {
-                bail!("registered election source address does not match wallet");
+            for attempt in 1..=app.confirmation_attempts.max(1) {
+                if attempt > 1 {
+                    sleep(app.confirmation_interval()).await;
+                }
+
+                let updated = elector.get_data().await?;
+                let Some(current) = updated.current_election() else {
+                    log_info(format!(
+                        "waiting for election confirmation attempt={} reason=no_current_election",
+                        attempt
+                    ));
+                    continue;
+                };
+
+                if let Some(member) = current.member(&validator_key) {
+                    if member.src_addr != wallet.address().address {
+                        bail!("registered election source address does not match wallet");
+                    }
+
+                    log_info(format!(
+                        "election request confirmed election_id={} registered_stake={}",
+                        current.elect_at, member.msg_value
+                    ));
+                    return Ok(clamp_wait_secs(
+                        until_elections_end,
+                        app.max_sleep_interval(),
+                    ));
+                }
+
+                log_info(format!(
+                    "waiting for election confirmation attempt={} election_id={}",
+                    attempt, current.elect_at
+                ));
             }
 
-            log_info(format!(
-                "election request confirmed election_id={} registered_stake={}",
-                current.elect_at, member.msg_value
-            ));
-            Ok(clamp_wait_secs(
-                until_elections_end,
-                app.max_sleep_interval(),
-            ))
+            bail!("validator key is not registered after participation confirmation timeout")
         }
     }
 }
@@ -306,6 +323,8 @@ struct AppConfig {
     once: bool,
     retry: usize,
     stake_factor: Option<u32>,
+    confirmation_attempts: usize,
+    confirmation_interval_secs: u64,
     poll_interval_secs: u64,
     max_sleep_interval_secs: u64,
     error_retry_interval_secs: u64,
@@ -322,6 +341,8 @@ impl Default for AppConfig {
             once: false,
             retry: 3,
             stake_factor: None,
+            confirmation_attempts: 20,
+            confirmation_interval_secs: 3,
             poll_interval_secs: 60,
             max_sleep_interval_secs: 300,
             error_retry_interval_secs: 30,
@@ -356,6 +377,10 @@ impl AppConfig {
     fn error_retry_interval(&self) -> Duration {
         Duration::from_secs(self.error_retry_interval_secs)
     }
+
+    fn confirmation_interval(&self) -> Duration {
+        Duration::from_secs(self.confirmation_interval_secs)
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -367,6 +392,8 @@ struct AppConfigTemplate<'a> {
     once: bool,
     retry: usize,
     stake_factor: Option<u32>,
+    confirmation_attempts: usize,
+    confirmation_interval_secs: u64,
     poll_interval_secs: u64,
     max_sleep_interval_secs: u64,
     error_retry_interval_secs: u64,
@@ -381,6 +408,8 @@ fn default_template() -> AppConfigTemplate<'static> {
         once: false,
         retry: 3,
         stake_factor: None,
+        confirmation_attempts: 20,
+        confirmation_interval_secs: 3,
         poll_interval_secs: 60,
         max_sleep_interval_secs: 300,
         error_retry_interval_secs: 30,

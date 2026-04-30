@@ -25,6 +25,8 @@ The default config file is `ever-elect.json`:
   "once": false,
   "retry": 3,
   "stake_factor": null,
+  "confirmation_attempts": 20,
+  "confirmation_interval_secs": 3,
   "poll_interval_secs": 60,
   "max_sleep_interval_secs": 300,
   "error_retry_interval_secs": 30
