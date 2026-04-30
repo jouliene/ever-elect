@@ -1,0 +1,12 @@
+{
+  "endpoint": "https://rpc-testnet.tychoprotocol.com",
+  "node_keys_path": "~/.tycho/node_keys.json",
+  "elections_path": "~/.tycho/elections.json",
+  "send": false,
+  "once": false,
+  "retry": 3,
+  "stake_factor": null,
+  "poll_interval_secs": 60,
+  "max_sleep_interval_secs": 300,
+  "error_retry_interval_secs": 30
+}
