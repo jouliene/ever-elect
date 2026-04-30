@@ -9,7 +9,10 @@ wallet.
 ## Install
 
 ```bash
+git clone https://github.com/jouliene/ever-elect.git
+cd ever-elect
 ./install.sh
+ever-elect init
 ```
 
 The installer builds the release binary and copies it to:
