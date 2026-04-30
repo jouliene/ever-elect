@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::signal;
 use tokio::time::{Duration, sleep};
 
-const DEFAULT_CONFIG_PATH: &str = "ever-elect.json";
+const CONFIG_FILE_NAME: &str = "ever-elect.json";
 const ONE_TOKEN: u128 = 1_000_000_000;
 const MASTERCHAIN: i8 = -1;
 
@@ -142,16 +142,16 @@ impl CliCommand {
         let args = std::env::args().skip(1).collect::<Vec<_>>();
         match args.as_slice() {
             [] => Ok(Self::Run {
-                config_path: PathBuf::from(DEFAULT_CONFIG_PATH),
+                config_path: default_config_path(),
             }),
             [cmd] if cmd == "run" => Ok(Self::Run {
-                config_path: PathBuf::from(DEFAULT_CONFIG_PATH),
+                config_path: default_config_path(),
             }),
             [cmd, path] if cmd == "run" => Ok(Self::Run {
                 config_path: PathBuf::from(path),
             }),
             [cmd] if cmd == "init" => Ok(Self::Init {
-                config_path: PathBuf::from(DEFAULT_CONFIG_PATH),
+                config_path: default_config_path(),
             }),
             [cmd, path] if cmd == "init" => Ok(Self::Init {
                 config_path: PathBuf::from(path),
@@ -167,7 +167,7 @@ impl CliCommand {
 
 fn print_help() {
     println!(
-        "Usage:\n  ever-elect run [config]\n  ever-elect init [config]\n  ever-elect help\n\nNo command is the same as `ever-elect run ever-elect.json`."
+        "Usage:\n  ever-elect run [config]\n  ever-elect init [config]\n  ever-elect help\n\nDefault config: ~/.tycho/ever-elect.json"
     );
 }
 
@@ -222,9 +222,15 @@ fn write_default_config_if_missing(path: &Path) -> Result<bool> {
         }
     }
 
-    fs::write(path, serde_json::to_string_pretty(&default_template())?)
+    let config = format!("{}\n", serde_json::to_string_pretty(&default_template())?);
+    fs::write(path, config)
         .with_context(|| format!("failed to write default config {}", path.display()))?;
     Ok(true)
+}
+
+fn default_config_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
+    PathBuf::from(home).join(".tycho").join(CONFIG_FILE_NAME)
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf> {
@@ -541,13 +547,6 @@ struct AppConfigTemplate<'a> {
     node_keys_path: &'a str,
     elections_path: &'a str,
     send: bool,
-    once: bool,
-    retry: usize,
-    stake_factor: Option<u32>,
-    confirmation_attempts: usize,
-    confirmation_interval_secs: u64,
-    poll_interval_secs: u64,
-    error_retry_interval_secs: u64,
 }
 
 fn default_template() -> AppConfigTemplate<'static> {
@@ -556,13 +555,6 @@ fn default_template() -> AppConfigTemplate<'static> {
         node_keys_path: "~/.tycho/node_keys.json",
         elections_path: "~/.tycho/elections.json",
         send: false,
-        once: false,
-        retry: 3,
-        stake_factor: None,
-        confirmation_attempts: 20,
-        confirmation_interval_secs: 3,
-        poll_interval_secs: 60,
-        error_retry_interval_secs: 30,
     }
 }
 
@@ -637,6 +629,5 @@ fn log_error(message: impl AsRef<str>) {
 }
 
 fn log(level: &str, message: &str) {
-    let ts = chrono::Local::now().format("%b %d %H:%M:%S");
-    println!("{ts} ever-elect[{level}]: {message}");
+    println!("{level} ever-elect: {message}");
 }
