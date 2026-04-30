@@ -76,6 +76,11 @@ existing workchain `0` DePool address or a stored DePool deployment plan. Set
 `send` to `true` only after checking the endpoint, node key, wallet, DePool, and
 stake/deployment settings.
 
+For DePool validation, `depool_participate_value` controls how much value is
+attached to the validator request sent to DePool. It is gas/change, not the
+stake; the stake is added earlier with `addOrdinaryStake` and DePool forwards
+the ready round stake through its proxy.
+
 ## Run
 
 Manual run:

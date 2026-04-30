@@ -15,6 +15,7 @@ const DEFAULT_CONFIG_FOLDER: &str = "~/.tycho";
 const ONE_TOKEN: u128 = 1_000_000_000;
 const MASTERCHAIN: i8 = -1;
 const BASECHAIN: i8 = 0;
+const DEFAULT_DEPOOL_PARTICIPATE_VALUE: &str = "5";
 const DEPOOL_ROUND_STEP_WAITING_VALIDATOR_REQUEST: u8 = 2;
 
 #[tokio::main]
@@ -777,6 +778,7 @@ async fn run_depool_election(
         return Ok(app.poll_interval());
     };
     config.check_stake(ready_round.stake as u128)?;
+    let participate_value = app.depool_participate_value_nano()?;
 
     let stake_factor = config.compute_stake_factor(app.stake_factor)?;
     let adnl_addr = validator_key;
@@ -799,7 +801,7 @@ async fn run_depool_election(
         ready_round.proxy,
         ready_round.stake,
         ready_round.validator_stake,
-        DEFAULT_DEPOOL_GAS,
+        participate_value,
         stake_factor
     ));
 
@@ -808,17 +810,19 @@ async fn run_depool_election(
         return Ok(app.poll_interval());
     }
 
-    let receipt = depool
-        .participate_in_elections(
-            wallet,
-            now_millis()?,
-            validator_key,
-            current.elect_at,
-            stake_factor,
-            adnl_addr,
-            signature,
-        )
-        .await?;
+    let receipt = send_depool_participate_request(
+        depool,
+        wallet,
+        app,
+        participate_value,
+        now_millis()?,
+        validator_key,
+        current.elect_at,
+        stake_factor,
+        adnl_addr,
+        signature,
+    )
+    .await?;
     log_info(format!(
         "depool_participate_message_hash={}",
         receipt.message_hash
@@ -944,6 +948,40 @@ fn required_depool_validator_stake(depool: &DePool, config: &DepoolRuntimeConfig
         .validator_assurance
         .max(depool.min_stake)
         .max(config.new_validator_assurance_nano()?))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_depool_participate_request(
+    depool: &DePool,
+    wallet: &mut EverWallet,
+    app: &AppConfig,
+    value: u128,
+    query_id: u64,
+    validator_key: HashBytes,
+    stake_at: u32,
+    max_factor: u32,
+    adnl_addr: HashBytes,
+    signature: impl AsRef<[u8]>,
+) -> Result<SendReceipt> {
+    let payload = build_participate_in_elections_payload(
+        query_id,
+        validator_key,
+        stake_at,
+        max_factor,
+        adnl_addr,
+        signature,
+    )?;
+
+    wallet
+        .send_transaction_safe_with_retry(
+            &depool.address,
+            value,
+            true,
+            3,
+            Some(&payload),
+            app.retry,
+        )
+        .await
 }
 
 async fn confirm_simple_participation(
@@ -1232,6 +1270,7 @@ struct AppConfig {
     once: bool,
     retry: usize,
     stake_factor: Option<u32>,
+    depool_participate_value: String,
     confirmation_attempts: usize,
     confirmation_interval_secs: u64,
     poll_interval_secs: u64,
@@ -1250,6 +1289,7 @@ impl Default for AppConfig {
             once: false,
             retry: 3,
             stake_factor: None,
+            depool_participate_value: DEFAULT_DEPOOL_PARTICIPATE_VALUE.to_owned(),
             confirmation_attempts: 20,
             confirmation_interval_secs: 3,
             poll_interval_secs: 60,
@@ -1284,6 +1324,14 @@ impl AppConfig {
 
     fn confirmation_interval(&self) -> Duration {
         Duration::from_secs(self.confirmation_interval_secs)
+    }
+
+    fn depool_participate_value_nano(&self) -> Result<u128> {
+        let value = parse_tokens_to_nano(&self.depool_participate_value)?;
+        if value == 0 {
+            bail!("depool_participate_value must be greater than zero");
+        }
+        Ok(value)
     }
 }
 
