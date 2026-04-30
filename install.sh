@@ -29,6 +29,7 @@ ensure_cargo() {
 
 ensure_cargo
 
+cargo update -p minik2
 cargo build --release
 
 mkdir -p "$HOME/.cargo/bin"

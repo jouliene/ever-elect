@@ -1675,14 +1675,23 @@ struct AppConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     elections_path: Option<PathBuf>,
     send: bool,
+    #[serde(skip_serializing)]
     once: bool,
+    #[serde(skip_serializing)]
     retry: usize,
+    #[serde(skip_serializing)]
     stake_factor: Option<u32>,
+    #[serde(skip_serializing)]
     depool_participate_value: String,
+    #[serde(skip_serializing)]
     depool_wallet_reserve: String,
+    #[serde(skip_serializing)]
     confirmation_attempts: usize,
+    #[serde(skip_serializing)]
     confirmation_interval_secs: u64,
+    #[serde(skip_serializing)]
     poll_interval_secs: u64,
+    #[serde(skip_serializing)]
     error_retry_interval_secs: u64,
     validation: ValidationConfig,
 }
@@ -2105,4 +2114,34 @@ fn log_error(message: impl AsRef<str>) {
 
 fn log(level: &str, message: &str) {
     println!("{level}: {message}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_config_serialization_hides_internal_settings() {
+        let value = serde_json::to_value(AppConfig::default()).expect("serialize config");
+        let object = value.as_object().expect("config object");
+
+        for key in [
+            "once",
+            "retry",
+            "stake_factor",
+            "depool_participate_value",
+            "depool_wallet_reserve",
+            "confirmation_attempts",
+            "confirmation_interval_secs",
+            "poll_interval_secs",
+            "error_retry_interval_secs",
+        ] {
+            assert!(!object.contains_key(key), "{key} should be internal");
+        }
+
+        assert!(object.contains_key("endpoint"));
+        assert!(object.contains_key("node_keys_path"));
+        assert!(object.contains_key("send"));
+        assert!(object.contains_key("validation"));
+    }
 }

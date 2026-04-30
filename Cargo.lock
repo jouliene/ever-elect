@@ -1072,7 +1072,7 @@ checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 [[package]]
 name = "minik2"
 version = "0.1.0"
-source = "git+https://github.com/jouliene/minik2#3cf2fc733805343c918525ec080b189e2cccfe42"
+source = "git+https://github.com/jouliene/minik2?branch=main#3cf2fc733805343c918525ec080b189e2cccfe42"
 dependencies = [
  "anyhow",
  "bip39",
