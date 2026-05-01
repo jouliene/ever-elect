@@ -228,7 +228,7 @@ pub(crate) struct DepoolValidationConfig {
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub(crate) enum DepoolConfig {
     New(NewDepoolConfig),
-    Existing { address: String },
+    Existing(ExistingDepoolConfig),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -249,6 +249,74 @@ impl NewDepoolConfig {
 
     pub(crate) fn validator_assurance_nano(&self) -> Result<u128> {
         parse_tokens_to_nano(&self.validator_assurance)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct ExistingDepoolConfig {
+    pub(crate) address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) seed: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) public: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) secret: Option<String>,
+}
+
+impl ExistingDepoolConfig {
+    pub(crate) fn address(address: String) -> Self {
+        Self {
+            address,
+            seed: None,
+            public: None,
+            secret: None,
+        }
+    }
+
+    pub(crate) fn from_seed(seed: String) -> Result<Self> {
+        let keys = KeyPair::from_seed(&seed)?;
+        let address = DePool::compute_address(BASECHAIN, &keys)?.to_string();
+        Ok(Self {
+            address,
+            seed: Some(seed),
+            public: Some(keys.public_key_hex()),
+            secret: Some(keys.secret_key_hex()),
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        ensure_workchain(&self.address, BASECHAIN)?;
+
+        if let Some(seed) = &self.seed {
+            let keys = KeyPair::from_seed(seed).context("invalid DePool seed")?;
+            self.validate_keys(&keys)?;
+        }
+
+        if let Some(secret) = &self.secret {
+            let keys = KeyPair::from_secret_hex(secret).context("invalid DePool secret")?;
+            self.validate_keys(&keys)?;
+        }
+
+        Ok(())
+    }
+
+    fn validate_keys(&self, keys: &KeyPair) -> Result<()> {
+        if let Some(public) = &self.public
+            && keys.public_key_hex() != *public
+        {
+            bail!("DePool public key does not match secret");
+        }
+
+        let expected = DePool::compute_address(BASECHAIN, keys)?;
+        if expected.to_string() != self.address {
+            bail!(
+                "DePool address mismatch: config has {}, derived {}",
+                self.address,
+                expected
+            );
+        }
+
+        Ok(())
     }
 }
 
@@ -282,10 +350,10 @@ impl DepoolRuntimeConfig {
                     new: Some(new.clone()),
                 })
             }
-            DepoolConfig::Existing { address } => {
-                ensure_workchain(address, BASECHAIN)?;
+            DepoolConfig::Existing(existing) => {
+                existing.validate()?;
                 Ok(Self {
-                    address: address.clone(),
+                    address: existing.address.clone(),
                     new: None,
                 })
             }
@@ -415,5 +483,44 @@ mod tests {
         assert!(object.contains_key("endpoint"));
         assert!(object.contains_key("node_keys_path"));
         assert!(object.contains_key("validation"));
+    }
+
+    #[test]
+    fn restored_existing_depool_serializes_credentials() {
+        let seed = Seed::generate().expect("generate seed").to_string();
+        let depool = ExistingDepoolConfig::from_seed(seed.clone()).expect("restore depool");
+        let value = serde_json::to_value(DepoolConfig::Existing(depool)).expect("serialize depool");
+        let object = value.as_object().expect("depool object");
+
+        assert_eq!(object["mode"], "existing");
+        assert_eq!(object["seed"], seed);
+        assert!(
+            object["public"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert!(
+            object["secret"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert!(!object.contains_key("min_stake"));
+        assert!(!object.contains_key("validator_assurance"));
+        assert!(!object.contains_key("participant_reward_fraction"));
+    }
+
+    #[test]
+    fn address_only_existing_depool_config_is_still_supported() {
+        let seed = Seed::generate().expect("generate seed").to_string();
+        let depool = ExistingDepoolConfig::from_seed(seed).expect("restore depool");
+        let value = serde_json::json!({
+            "mode": "existing",
+            "address": depool.address,
+        });
+
+        let parsed: DepoolConfig = serde_json::from_value(value).expect("parse depool config");
+        let runtime = DepoolRuntimeConfig::from_config(&parsed).expect("build runtime config");
+
+        assert!(runtime.new.is_none());
     }
 }

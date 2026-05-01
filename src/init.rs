@@ -142,7 +142,7 @@ fn prompt_validation(config_folder: &str) -> Result<ValidationConfig> {
                 3 => {
                     let address = prompt_text("Existing DePool address (workchain 0)", "")?;
                     ensure_workchain(&address, BASECHAIN)?;
-                    DepoolConfig::Existing { address }
+                    DepoolConfig::Existing(ExistingDepoolConfig::address(address))
                 }
                 _ => unreachable!(),
             };
@@ -216,14 +216,15 @@ fn prompt_new_depool_config(validator_wallet: &StoredWalletConfig) -> Result<New
 
 fn prompt_restore_depool_config() -> Result<DepoolConfig> {
     let seed = prompt_text("DePool seed phrase", "")?;
-    let keys = KeyPair::from_seed(&seed)?;
-    let address = DePool::compute_address(BASECHAIN, &keys)?.to_string();
+    let depool = ExistingDepoolConfig::from_seed(seed)?;
 
     println!("Restored DePool:");
-    println!("  address: {address}");
-    println!("  public:  {}", keys.public_key_hex());
+    println!("  address: {}", depool.address);
+    if let Some(public) = &depool.public {
+        println!("  public:  {public}");
+    }
 
-    Ok(DepoolConfig::Existing { address })
+    Ok(DepoolConfig::Existing(depool))
 }
 
 fn prompt_depool_config_from_keys(
