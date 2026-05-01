@@ -592,11 +592,14 @@ async fn update_depool_for_election(
 
     for attempt in 1..=DEPOOL_UPDATE_ATTEMPTS {
         depool.update().await?;
-        ensure_depool_round_stake(wallet, depool, config, app).await?;
-        depool.update().await?;
+        if !sent_ticktock {
+            ensure_depool_round_stake(wallet, depool, config, app).await?;
+            depool.update().await?;
+        }
 
         let required_stake = required_depool_stake(depool, config)?;
-        let Some(target_round) = select_target_depool_round(depool, required_stake)? else {
+        let Some(target_round) = select_target_depool_round(depool, required_stake, election_id)?
+        else {
             log_info(format!(
                 "depool target round is not available depool={} attempt={} required={} rounds={}",
                 depool.address,
@@ -1047,22 +1050,39 @@ struct ReadyDePoolRound {
 fn select_target_depool_round(
     depool: &DePool,
     required_stake: u64,
+    election_id: u32,
 ) -> Result<Option<ReadyDePoolRound>> {
-    if depool.proxies.is_empty() {
+    select_target_depool_round_from_state(
+        depool.get_rounds(),
+        &depool.proxies,
+        required_stake,
+        election_id,
+    )
+}
+
+fn select_target_depool_round_from_state(
+    rounds: &[DePoolRound],
+    proxies: &[StdAddr],
+    required_stake: u64,
+    election_id: u32,
+) -> Result<Option<ReadyDePoolRound>> {
+    if proxies.is_empty() {
         bail!("DePool has no proxies");
     }
 
-    let rounds = depool.get_rounds();
-    if rounds.len() < 3 {
+    let Some(round) = rounds
+        .iter()
+        .find(|round| round.supposed_elected_at == election_id && round.stake >= required_stake)
+        .or_else(|| {
+            rounds.iter().find(|round| {
+                round.step == DEPOOL_ROUND_STEP_POOLING && round.stake >= required_stake
+            })
+        })
+    else {
         return Ok(None);
-    }
+    };
 
-    let round = &rounds[1];
-    if round.stake < required_stake {
-        return Ok(None);
-    }
-
-    let proxy = depool.proxies[(round.id as usize) % depool.proxies.len()].clone();
+    let proxy = proxies[(round.id as usize) % proxies.len()].clone();
     Ok(Some(ReadyDePoolRound {
         id: round.id,
         step: round.step,
@@ -1185,5 +1205,84 @@ impl RuntimeValidation {
             Self::Simple { .. } => "simple",
             Self::Depool { .. } => "depool",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn proxy() -> StdAddr {
+        parse_std_addr("0:1111111111111111111111111111111111111111111111111111111111111111")
+            .expect("valid address")
+    }
+
+    fn depool_round(id: u64, step: u8, stake: u64, supposed_elected_at: u32) -> DePoolRound {
+        DePoolRound {
+            id,
+            supposed_elected_at,
+            unfreeze: 0,
+            stake_held_for: 0,
+            vset_hash_in_election_phase: 0,
+            step,
+            completion_reason: 0,
+            stake,
+            recovered_stake: 0,
+            unused: 0,
+            is_validator_stake_completed: false,
+            participant_reward: 0,
+            participant_qty: 0,
+            validator_stake: 0,
+            validator_remaining_stake: 0,
+            handled_stakes_and_rewards: 0,
+        }
+    }
+
+    #[test]
+    fn selects_funded_pooling_round_as_ticktock_candidate() {
+        let rounds = vec![
+            depool_round(0, 9, 0, 0),
+            depool_round(1, 6, 0, 0),
+            depool_round(2, DEPOOL_ROUND_STEP_POOLING, 505_000_000_000_000, 0),
+            depool_round(3, 0, 0, 0),
+        ];
+
+        let selected = select_target_depool_round_from_state(
+            &rounds,
+            &[proxy()],
+            5_000_000_000_000,
+            1_777_634_017,
+        )
+        .expect("select target round")
+        .expect("pooling round should be selected");
+
+        assert_eq!(selected.id, 2);
+        assert_eq!(selected.step, DEPOOL_ROUND_STEP_POOLING);
+    }
+
+    #[test]
+    fn prefers_current_election_round_over_pooling_candidate() {
+        let election_id = 1_777_634_017;
+        let rounds = vec![
+            depool_round(2, DEPOOL_ROUND_STEP_POOLING, 505_000_000_000_000, 0),
+            depool_round(
+                4,
+                DEPOOL_ROUND_STEP_WAITING_VALIDATOR_REQUEST,
+                505_000_000_000_000,
+                election_id,
+            ),
+        ];
+
+        let selected = select_target_depool_round_from_state(
+            &rounds,
+            &[proxy()],
+            5_000_000_000_000,
+            election_id,
+        )
+        .expect("select target round")
+        .expect("current election round should be selected");
+
+        assert_eq!(selected.id, 4);
+        assert_eq!(selected.step, DEPOOL_ROUND_STEP_WAITING_VALIDATOR_REQUEST);
     }
 }

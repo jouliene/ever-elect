@@ -10,6 +10,7 @@ pub(crate) const MASTERCHAIN: i8 = -1;
 pub(crate) const BASECHAIN: i8 = 0;
 pub(crate) const DEFAULT_DEPOOL_PARTICIPATE_VALUE: &str = "5";
 pub(crate) const DEFAULT_DEPOOL_WALLET_RESERVE: &str = "20";
+pub(crate) const DEPOOL_ROUND_STEP_POOLING: u8 = 1;
 pub(crate) const DEPOOL_ROUND_STEP_WAITING_VALIDATOR_REQUEST: u8 = 2;
 pub(crate) const DEPOOL_COMPLETION_REASON_FAKE_ROUND: u8 = 2;
 pub(crate) const DEPOOL_MIN_BALANCE: u128 = 20 * ONE_TOKEN;
