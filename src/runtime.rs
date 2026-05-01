@@ -592,10 +592,8 @@ async fn update_depool_for_election(
 
     for attempt in 1..=DEPOOL_UPDATE_ATTEMPTS {
         depool.update().await?;
-        if !sent_ticktock {
-            ensure_depool_round_stake(wallet, depool, config, app).await?;
-            depool.update().await?;
-        }
+        ensure_depool_round_stake(wallet, depool, config, app).await?;
+        depool.update().await?;
 
         let required_stake = required_depool_stake(depool, config)?;
         let Some(target_round) = select_target_depool_round(depool, required_stake, election_id)?
