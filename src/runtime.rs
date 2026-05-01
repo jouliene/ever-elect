@@ -460,6 +460,8 @@ async fn prepare_depool(
         );
     }
 
+    ensure_depool_round_stake(wallet, depool, config, app).await?;
+
     Ok(true)
 }
 
