@@ -127,7 +127,7 @@ async fn run_once(
     ));
 
     match &mut runtime.validation {
-        RuntimeValidation::Depool { depool, config } => {
+        RuntimeValidation::Depool { depool, config, .. } => {
             if !prepare_depool(transport, &mut runtime.wallet, depool.as_mut(), config, app).await?
             {
                 return Ok(app.poll_interval());
@@ -186,6 +186,7 @@ async fn run_once(
                 RuntimeValidation::Depool {
                     depool,
                     config: depool_config,
+                    missed_election_id,
                 } => {
                     run_depool_election(
                         &config,
@@ -198,6 +199,7 @@ async fn run_once(
                         app,
                         elections_end,
                         until_elections_end,
+                        missed_election_id,
                     )
                     .await
                 }
@@ -295,8 +297,13 @@ async fn run_depool_election(
     app: &AppConfig,
     elections_end: u32,
     until_elections_end: u32,
+    missed_election_id: &mut Option<u32>,
 ) -> Result<Duration> {
     let validator_key = HashBytes(node_keys.public_key_bytes());
+    if missed_election_id.is_some_and(|election_id| election_id != current.elect_at) {
+        *missed_election_id = None;
+    }
+
     if let Some(member) = current.member(&validator_key)
         && depool_has_source(depool, &member.src_addr)
     {
@@ -307,15 +314,42 @@ async fn run_depool_election(
         return Ok(boundary_wait_secs(until_elections_end));
     }
 
-    let Some(ready_round) =
-        update_depool_for_election(wallet, depool, depool_config, app, current.elect_at).await?
-    else {
+    if *missed_election_id == Some(current.elect_at) {
         log_info(format!(
-            "depool is not ready for election_id={}; rounds={}",
+            "depool current election was already marked unavailable election_id={}; waiting for next election; rounds={}",
             current.elect_at,
             format_depool_rounds(depool)
         ));
         return Ok(app.poll_interval());
+    }
+
+    let ready_round = match update_depool_for_election(
+        wallet,
+        depool,
+        depool_config,
+        app,
+        current.elect_at,
+    )
+    .await?
+    {
+        DePoolElectionUpdate::Ready(round) => round,
+        DePoolElectionUpdate::NotReady => {
+            log_info(format!(
+                "depool is not ready for election_id={}; rounds={}",
+                current.elect_at,
+                format_depool_rounds(depool)
+            ));
+            return Ok(app.poll_interval());
+        }
+        DePoolElectionUpdate::MissedCurrentElection => {
+            *missed_election_id = Some(current.elect_at);
+            log_info(format!(
+                "depool current election is unavailable for this pooling round election_id={}; waiting for next election; rounds={}",
+                current.elect_at,
+                format_depool_rounds(depool)
+            ));
+            return Ok(app.poll_interval());
+        }
     };
 
     if ready_round.step != DEPOOL_ROUND_STEP_WAITING_VALIDATOR_REQUEST {
@@ -685,7 +719,7 @@ async fn update_depool_for_election(
     config: &DepoolRuntimeConfig,
     app: &AppConfig,
     election_id: u32,
-) -> Result<Option<ReadyDePoolRound>> {
+) -> Result<DePoolElectionUpdate> {
     let mut sent_ticktock = false;
 
     for attempt in 1..=DEPOOL_UPDATE_ATTEMPTS {
@@ -703,7 +737,7 @@ async fn update_depool_for_election(
                 required_stake,
                 format_depool_rounds(depool)
             ));
-            return Ok(None);
+            return Ok(DePoolElectionUpdate::NotReady);
         };
 
         log_info(format!(
@@ -720,7 +754,7 @@ async fn update_depool_for_election(
         ));
 
         if target_round.supposed_elected_at == election_id {
-            return Ok(Some(target_round));
+            return Ok(DePoolElectionUpdate::Ready(target_round));
         }
 
         if sent_ticktock && target_round.completion_reason == DEPOOL_COMPLETION_REASON_FAKE_ROUND {
@@ -728,17 +762,31 @@ async fn update_depool_for_election(
                 "depool target round is fake after ticktock depool={} round_id={}",
                 depool.address, target_round.id
             ));
-            return Ok(None);
+            return Ok(DePoolElectionUpdate::NotReady);
         }
 
         if attempt == DEPOOL_UPDATE_ATTEMPTS {
+            if target_round.step == DEPOOL_ROUND_STEP_POOLING {
+                log_info(format!(
+                    "depool pooling round did not enter validator request after ticktock depool={} election_id={} round_id={} supposed_elected_at={} stake={} validator_stake={} rounds={}",
+                    depool.address,
+                    election_id,
+                    target_round.id,
+                    target_round.supposed_elected_at,
+                    target_round.stake,
+                    target_round.validator_stake,
+                    format_depool_rounds(depool)
+                ));
+                return Ok(DePoolElectionUpdate::MissedCurrentElection);
+            }
+
             log_info(format!(
                 "failed to update DePool target round depool={} election_id={} rounds={}",
                 depool.address,
                 election_id,
                 format_depool_rounds(depool)
             ));
-            return Ok(None);
+            return Ok(DePoolElectionUpdate::NotReady);
         }
 
         wallet.update().await?;
@@ -750,7 +798,7 @@ async fn update_depool_for_election(
                 wallet_operation_reserve(app)?
             ));
             log_validator_wallet_topup(wallet, app, DEPOOL_TICKTOCK_VALUE, "depool_ticktock")?;
-            return Ok(None);
+            return Ok(DePoolElectionUpdate::NotReady);
         }
 
         log_info(format!(
@@ -776,7 +824,7 @@ async fn update_depool_for_election(
         sleep(Duration::from_secs(DEPOOL_TICKTOCK_INTERVAL_SECS)).await;
     }
 
-    Ok(None)
+    Ok(DePoolElectionUpdate::NotReady)
 }
 
 async fn ensure_depool_round_stake(
@@ -1145,6 +1193,13 @@ struct ReadyDePoolRound {
     validator_stake: u64,
 }
 
+#[derive(Debug, Clone)]
+enum DePoolElectionUpdate {
+    Ready(ReadyDePoolRound),
+    NotReady,
+    MissedCurrentElection,
+}
+
 fn select_target_depool_round(
     depool: &DePool,
     required_stake: u64,
@@ -1324,6 +1379,7 @@ impl RuntimeState {
                     validation: RuntimeValidation::Depool {
                         depool: Box::new(depool),
                         config: runtime_config,
+                        missed_election_id: None,
                     },
                 })
             }
@@ -1339,6 +1395,7 @@ enum RuntimeValidation {
     Depool {
         depool: Box<DePool>,
         config: DepoolRuntimeConfig,
+        missed_election_id: Option<u32>,
     },
 }
 
