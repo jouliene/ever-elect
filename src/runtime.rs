@@ -818,11 +818,19 @@ fn depool_pooling_round_stake(
     depool: &DePool,
     participant: Option<&DePoolParticipant>,
 ) -> DePoolRoundStake {
-    let rounds = depool.get_rounds();
+    depool_pooling_round_stake_from_state(depool.get_rounds(), participant)
+}
 
+fn depool_pooling_round_stake_from_state(
+    rounds: &[DePoolRound],
+    participant: Option<&DePoolParticipant>,
+) -> DePoolRoundStake {
     if rounds.len() >= 3 {
         let prev_round = &rounds[0];
-        let pooling_round = &rounds[2];
+        let pooling_round = rounds
+            .iter()
+            .find(|round| round.step == DEPOOL_ROUND_STEP_POOLING)
+            .unwrap_or(&rounds[2]);
         let current = participant_round_stake(participant, pooling_round.id)
             + participant_round_stake(participant, prev_round.id);
 
@@ -1236,6 +1244,32 @@ mod tests {
         }
     }
 
+    fn participant_with_rounds(rounds: &[(u64, u64)]) -> DePoolParticipant {
+        let address = proxy();
+        DePoolParticipant {
+            address: address.clone(),
+            round_qty: rounds.len() as u8,
+            reward: 0,
+            vesting_parts: 0,
+            lock_parts: 0,
+            reinvest: false,
+            withdraw_value: 0,
+            vesting_donor: address.clone(),
+            lock_donor: address,
+            total_round_stake: rounds.iter().map(|(_, total)| *total as u128).sum(),
+            rounds: rounds
+                .iter()
+                .map(|(round_id, total)| DePoolParticipantRound {
+                    round_id: *round_id,
+                    ordinary: *total,
+                    vesting: 0,
+                    lock: 0,
+                    total: *total,
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn selects_funded_pooling_round_as_ticktock_candidate() {
         let rounds = vec![
@@ -1282,5 +1316,27 @@ mod tests {
 
         assert_eq!(selected.id, 4);
         assert_eq!(selected.step, DEPOOL_ROUND_STEP_WAITING_VALIDATOR_REQUEST);
+    }
+
+    #[test]
+    fn staking_target_tracks_pooling_step_after_ticktock() {
+        let election_id = 1_777_634_017;
+        let rounds = vec![
+            depool_round(0, 9, 0, 0),
+            depool_round(1, 6, 0, 0),
+            depool_round(
+                2,
+                DEPOOL_ROUND_STEP_WAITING_VALIDATOR_REQUEST,
+                505_000_000_000_000,
+                election_id,
+            ),
+            depool_round(3, DEPOOL_ROUND_STEP_POOLING, 0, 0),
+        ];
+        let participant = participant_with_rounds(&[(2, 5_000_000_000_000)]);
+
+        let stake = depool_pooling_round_stake_from_state(&rounds, Some(&participant));
+
+        assert_eq!(stake.current, 0);
+        assert_eq!(stake.rounds_label, "pooling:3+prev:0");
     }
 }
