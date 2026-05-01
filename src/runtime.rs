@@ -452,6 +452,7 @@ async fn ensure_depool_deploy_balance(
             wallet.balance(),
             wallet_operation_reserve(app)?
         ));
+        log_validator_wallet_topup(wallet, app, topup, "depool_deploy_topup")?;
         return Ok(false);
     }
 
@@ -510,6 +511,7 @@ async fn maintain_depool_balance(
             topup,
             wallet_operation_reserve(app)?
         ));
+        log_validator_wallet_topup(wallet, app, topup, "depool_balance_topup")?;
         return Ok(());
     }
 
@@ -567,6 +569,7 @@ async fn maintain_depool_proxy_balances(
                 topup,
                 wallet_operation_reserve(app)?
             ));
+            log_validator_wallet_topup(wallet, app, topup, "depool_proxy_topup")?;
             continue;
         }
 
@@ -594,7 +597,13 @@ async fn maintain_depool_proxy_balances(
 }
 
 fn wallet_can_spend(wallet: &EverWallet, app: &AppConfig, value: u128) -> Result<bool> {
-    Ok(wallet.balance() > value.saturating_add(wallet_operation_reserve(app)?))
+    Ok(wallet.balance() >= wallet_required_balance(app, value)?)
+}
+
+fn wallet_required_balance(app: &AppConfig, value: u128) -> Result<u128> {
+    Ok(value
+        .saturating_add(wallet_operation_reserve(app)?)
+        .saturating_add(1))
 }
 
 fn wallet_operation_reserve(app: &AppConfig) -> Result<u128> {
@@ -627,7 +636,47 @@ async fn simple_wallet_can_transfer(
         value,
         reserve
     ));
+    log_simple_validator_wallet_topup(wallet, value, reserve, operation);
     Ok(false)
+}
+
+fn log_validator_wallet_topup(
+    wallet: &EverWallet,
+    app: &AppConfig,
+    operation_value: u128,
+    reason: &str,
+) -> Result<()> {
+    let required_balance = wallet_required_balance(app, operation_value)?;
+    log_info(format!(
+        "topup_validator_wallet wallet={} with_at_least={} reason={} balance={} required_balance={} operation_value={} reserve={}",
+        wallet.address(),
+        required_balance.saturating_sub(wallet.balance()),
+        reason,
+        wallet.balance(),
+        required_balance,
+        operation_value,
+        wallet_operation_reserve(app)?
+    ));
+    Ok(())
+}
+
+fn log_simple_validator_wallet_topup(
+    wallet: &EverWallet,
+    operation_value: u128,
+    reserve: u128,
+    reason: &str,
+) {
+    let required_balance = operation_value.saturating_add(reserve);
+    log_info(format!(
+        "topup_validator_wallet wallet={} with_at_least={} reason=simple_{} balance={} required_balance={} operation_value={} reserve={}",
+        wallet.address(),
+        required_balance.saturating_sub(wallet.balance()),
+        reason,
+        wallet.balance(),
+        required_balance,
+        operation_value,
+        reserve
+    ));
 }
 
 async fn update_depool_for_election(
@@ -700,6 +749,7 @@ async fn update_depool_for_election(
                 DEPOOL_TICKTOCK_VALUE,
                 wallet_operation_reserve(app)?
             ));
+            log_validator_wallet_topup(wallet, app, DEPOOL_TICKTOCK_VALUE, "depool_ticktock")?;
             return Ok(None);
         }
 
@@ -750,6 +800,7 @@ async fn ensure_depool_round_stake(
     wallet.update().await?;
     let missing_stake = (required as u128).saturating_sub(round_stake.current);
     let stake_to_add = missing_stake.max(depool.min_stake as u128);
+    let stake_message_value = stake_to_add.saturating_add(DEFAULT_DEPOOL_GAS);
     let Some(stake_budget) = depool_available_stake(wallet.balance(), app)? else {
         log_info(format!(
             "wallet balance is too low for DePool staking balance={} required={} wallet_reserve={} participate_reserve={} gas_reserve={}",
@@ -759,6 +810,7 @@ async fn ensure_depool_round_stake(
             app.depool_participate_value_nano()?,
             DEFAULT_DEPOOL_GAS
         ));
+        log_validator_wallet_topup(wallet, app, stake_message_value, "depool_add_stake")?;
         return Ok(());
     };
 
@@ -773,6 +825,7 @@ async fn ensure_depool_round_stake(
             stake_budget.stake,
             round_stake.rounds_label
         ));
+        log_validator_wallet_topup(wallet, app, stake_message_value, "depool_add_stake")?;
         return Ok(());
     }
 
