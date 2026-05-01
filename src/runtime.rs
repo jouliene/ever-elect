@@ -21,6 +21,11 @@ pub(crate) async fn run(config_path: PathBuf) -> Result<()> {
     let mut runtime = RuntimeState::new(&transport, &app)?;
 
     log_info("started validation loop");
+    log_info(format!(
+        "version={} build_commit={}",
+        env!("CARGO_PKG_VERSION"),
+        env!("EVER_ELECT_BUILD_COMMIT")
+    ));
     log_info("transport=jrpc");
     log_info(format!("endpoint={}", app.endpoint));
     log_info(format!("node_keys={}", app.node_keys_path.display()));
