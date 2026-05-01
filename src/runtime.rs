@@ -321,11 +321,12 @@ async fn run_depool_election(
 
     if *missed_election_id == Some(current.elect_at) {
         log_info(format!(
-            "depool current election was already marked unavailable election_id={}; waiting for next election; rounds={}",
+            "depool current election was already marked unavailable election_id={} until_end={}; waiting for next election; rounds={}",
             current.elect_at,
+            until_elections_end,
             format_depool_rounds(depool)
         ));
-        return Ok(app.poll_interval());
+        return Ok(boundary_wait_secs(until_elections_end));
     }
 
     let ready_round = match update_depool_for_election(
@@ -349,11 +350,12 @@ async fn run_depool_election(
         DePoolElectionUpdate::MissedCurrentElection => {
             *missed_election_id = Some(current.elect_at);
             log_info(format!(
-                "depool current election is unavailable for this pooling round election_id={}; waiting for next election; rounds={}",
+                "depool current election is unavailable for this pooling round election_id={} until_end={}; waiting for next election; rounds={}",
                 current.elect_at,
+                until_elections_end,
                 format_depool_rounds(depool)
             ));
-            return Ok(app.poll_interval());
+            return Ok(boundary_wait_secs(until_elections_end));
         }
     };
 
