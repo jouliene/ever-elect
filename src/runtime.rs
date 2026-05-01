@@ -128,7 +128,10 @@ async fn run_once(
 
     match &mut runtime.validation {
         RuntimeValidation::Depool { depool, config } => {
-            prepare_depool(transport, &mut runtime.wallet, depool.as_mut(), config, app).await?;
+            if !prepare_depool(transport, &mut runtime.wallet, depool.as_mut(), config, app).await?
+            {
+                return Ok(app.poll_interval());
+            }
         }
         RuntimeValidation::Simple { .. } => {}
     }
@@ -382,7 +385,7 @@ async fn prepare_depool(
     depool: &mut DePool,
     config: &DepoolRuntimeConfig,
     app: &AppConfig,
-) -> Result<()> {
+) -> Result<bool> {
     depool.update().await?;
 
     if !depool.is_active() {
@@ -392,32 +395,8 @@ async fn prepare_depool(
 
         log_info(format!("depool_not_active address={}", depool.address));
 
-        let target_balance = DEPOOL_TARGET_BALANCE.max(MIN_BALANCE_FOR_DEPLOY + DEFAULT_DEPOOL_GAS);
-        if depool.account_balance < target_balance {
-            let topup = target_balance - depool.account_balance;
-            log_info(format!(
-                "depool_deploy_topup depool={} balance={} target={} topup={}",
-                depool.address, depool.account_balance, target_balance, topup
-            ));
-            match wallet
-                .send_transaction_safe_with_retry(&depool.address, topup, false, 3, None, app.retry)
-                .await
-            {
-                Ok(receipt) => {
-                    log_info(format!(
-                        "depool_deploy_topup_success depool={} value={} hash={}",
-                        depool.address, topup, receipt.message_hash
-                    ));
-                }
-                Err(e) => {
-                    log_error(format!(
-                        "depool_deploy_topup_failed depool={} value={} error={e:#}",
-                        depool.address, topup
-                    ));
-                    return Err(e);
-                }
-            }
-            depool.update().await?;
+        if !ensure_depool_deploy_balance(wallet, depool, app).await? {
+            return Ok(false);
         }
 
         let depool_keys = KeyPair::from_secret_hex(&new_depool.secret)?;
@@ -447,7 +426,60 @@ async fn prepare_depool(
         );
     }
 
-    Ok(())
+    Ok(true)
+}
+
+async fn ensure_depool_deploy_balance(
+    wallet: &mut EverWallet,
+    depool: &mut DePool,
+    app: &AppConfig,
+) -> Result<bool> {
+    if depool.account_balance >= MIN_BALANCE_FOR_DEPLOY {
+        return Ok(true);
+    }
+
+    let target_balance = DEPOOL_TARGET_BALANCE.max(MIN_BALANCE_FOR_DEPLOY + DEFAULT_DEPOOL_GAS);
+    let topup = target_balance.saturating_sub(depool.account_balance);
+
+    wallet.update().await?;
+    if !wallet_can_spend(wallet, app, topup)? {
+        log_info(format!(
+            "depool_deploy_waiting_for_balance depool={} balance={} required={} missing={} wallet_balance={} wallet_reserve={}",
+            depool.address,
+            depool.account_balance,
+            MIN_BALANCE_FOR_DEPLOY,
+            MIN_BALANCE_FOR_DEPLOY.saturating_sub(depool.account_balance),
+            wallet.balance(),
+            wallet_operation_reserve(app)?
+        ));
+        return Ok(false);
+    }
+
+    log_info(format!(
+        "depool_deploy_topup depool={} balance={} target={} topup={}",
+        depool.address, depool.account_balance, target_balance, topup
+    ));
+    match wallet
+        .send_transaction_safe_with_retry(&depool.address, topup, false, 3, None, app.retry)
+        .await
+    {
+        Ok(receipt) => {
+            log_info(format!(
+                "depool_deploy_topup_success depool={} value={} hash={}",
+                depool.address, topup, receipt.message_hash
+            ));
+        }
+        Err(e) => {
+            log_error(format!(
+                "depool_deploy_topup_failed depool={} value={} error={e:#}",
+                depool.address, topup
+            ));
+            return Err(e);
+        }
+    }
+
+    depool.update().await?;
+    Ok(depool.account_balance >= MIN_BALANCE_FOR_DEPLOY)
 }
 
 async fn maintain_depool_balance(

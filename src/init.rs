@@ -245,6 +245,10 @@ fn prompt_depool_config_from_keys(
         println!("  seed:             {seed}");
     }
     println!("  validator wallet: {}", validator_wallet.address);
+    println!(
+        "  deploy balance:   fund this DePool address with at least {} nano before first run",
+        MIN_BALANCE_FOR_DEPLOY
+    );
 
     Ok(NewDepoolConfig {
         address,
