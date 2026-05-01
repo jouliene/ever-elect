@@ -20,6 +20,9 @@ pub(crate) const DEPOOL_PROXY_TARGET_BALANCE: u128 = 5 * ONE_TOKEN;
 pub(crate) const DEPOOL_UPDATE_ATTEMPTS: usize = 4;
 pub(crate) const DEPOOL_TICKTOCK_VALUE: u128 = ONE_TOKEN;
 pub(crate) const DEPOOL_TICKTOCK_INTERVAL_SECS: u64 = 60;
+pub(crate) const SIMPLE_STAKE_UNFREEZE_OFFSET_SECS: u32 = 10 * 60;
+pub(crate) const SIMPLE_ELECTIONS_END_OFFSET_SECS: u32 = 2 * 60;
+pub(crate) const MAX_ELECTOR_TIME_DIFF_SECS: u32 = 600;
 
 pub(crate) fn default_config_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());

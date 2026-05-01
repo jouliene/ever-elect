@@ -201,7 +201,7 @@ impl StakeConfig {
     pub(crate) fn stake_nano(
         &self,
         wallet_balance: u128,
-        elector_gas: u128,
+        election_overhead: u128,
         elections_stake: Option<&str>,
     ) -> Result<u128> {
         match self {
@@ -216,7 +216,7 @@ impl StakeConfig {
             } => {
                 let keep = parse_tokens_to_nano(keep_wallet_balance)?;
                 wallet_balance
-                    .checked_sub(keep.saturating_add(elector_gas))
+                    .checked_sub(keep.saturating_add(election_overhead))
                     .context("wallet balance is too low for floating stake")
             }
         }

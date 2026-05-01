@@ -119,12 +119,15 @@ async fn run_once(
         .timings()
         .map(|timings| timings.gen_utime)
         .unwrap_or_default();
+    let time_diff = now_sec()
+        .saturating_sub(gen_utime)
+        .min(MAX_ELECTOR_TIME_DIFF_SECS);
     let timeline = config.elections_timeline()?;
 
     log_info(format!(
         "gen_utime={} time_diff={} timeline={timeline:?} wallet_balance={}",
         gen_utime,
-        now_sec().saturating_sub(gen_utime),
+        time_diff,
         runtime.wallet.balance()
     ));
 
@@ -161,6 +164,12 @@ async fn run_once(
                     stake,
                     elections_stake,
                 } => {
+                    if let Some(wait) =
+                        simple_stake_unfreeze_wait(&elector_data, elections_end, time_diff)
+                    {
+                        return Ok(wait);
+                    }
+
                     run_simple_election(
                         &config,
                         &elector,
@@ -214,6 +223,27 @@ async fn run_simple_election(
     until_elections_end: u32,
 ) -> Result<Duration> {
     let validator_key = HashBytes(node_keys.public_key_bytes());
+    let price_factor = config.compute_price_factor(true)?;
+    let elector_gas = apply_price_factor(ONE_TOKEN, price_factor);
+    let transfer_reserve = simple_transfer_reserve(price_factor);
+
+    if let Some(credit) = elector_data.credit_for(&wallet.address().address)
+        && credit > 0
+    {
+        log_info(format!("recoverable_previous_stake={credit}"));
+        if app.send {
+            let message = elector.recover_stake_message(price_factor)?;
+            if !simple_wallet_can_transfer(wallet, message.value, transfer_reserve, "recover_stake")
+                .await?
+            {
+                return Ok(app.poll_interval());
+            }
+            let receipt = send_elector_message(wallet, config, &message, app.retry).await?;
+            log_info(format!("recover_message_hash={}", receipt.message_hash));
+            wallet.update().await?;
+        }
+    }
+
     if let Some(member) = current.member(&validator_key) {
         log_info(format!(
             "already participating election_id={} stake={} source={}",
@@ -222,19 +252,8 @@ async fn run_simple_election(
         return Ok(boundary_wait_secs(until_elections_end));
     }
 
-    if let Some(credit) = elector_data.credit_for(&wallet.address().address)
-        && credit > 0
-    {
-        log_info(format!("recoverable_previous_stake={credit}"));
-        if app.send {
-            let message = elector.recover_stake_message(config.compute_price_factor(true)?)?;
-            let receipt = send_elector_message(wallet, config, &message, app.retry).await?;
-            log_info(format!("recover_message_hash={}", receipt.message_hash));
-        }
-    }
-
-    let elector_gas = apply_price_factor(ONE_TOKEN, config.compute_price_factor(true)?);
-    let stake = stake_config.stake_nano(wallet.balance(), elector_gas, elections_stake)?;
+    let stake_overhead = elector_gas.saturating_add(transfer_reserve);
+    let stake = stake_config.stake_nano(wallet.balance(), stake_overhead, elections_stake)?;
     config.check_stake(stake)?;
     let stake_factor = config.compute_stake_factor(app.stake_factor)?;
 
@@ -254,9 +273,12 @@ async fn run_simple_election(
         election_id: current.elect_at,
         stake,
         stake_factor,
-        price_factor: config.compute_price_factor(true)?,
+        price_factor,
         signature_context: config.signature_context()?,
     })?;
+    if !simple_wallet_can_transfer(wallet, message.value, transfer_reserve, "participate").await? {
+        return Ok(app.poll_interval());
+    }
     let receipt = send_elector_message(wallet, config, &message, app.retry).await?;
     log_info(format!("participate_message_hash={}", receipt.message_hash));
 
@@ -579,6 +601,32 @@ fn wallet_operation_reserve(app: &AppConfig) -> Result<u128> {
         .depool_wallet_reserve_nano()?
         .saturating_add(app.depool_participate_value_nano()?)
         .saturating_add(DEFAULT_DEPOOL_GAS))
+}
+
+fn simple_transfer_reserve(price_factor: u64) -> u128 {
+    apply_price_factor(ONE_TOKEN / 2, price_factor)
+}
+
+async fn simple_wallet_can_transfer(
+    wallet: &mut EverWallet,
+    value: u128,
+    reserve: u128,
+    operation: &str,
+) -> Result<bool> {
+    wallet.update().await?;
+    let target_balance = value.saturating_add(reserve);
+    if wallet.balance() >= target_balance {
+        return Ok(true);
+    }
+
+    log_info(format!(
+        "wallet balance is too low for simple {operation} balance={} target_balance={} value={} reserve={}",
+        wallet.balance(),
+        target_balance,
+        value,
+        reserve
+    ));
+    Ok(false)
 }
 
 async fn update_depool_for_election(
@@ -1123,6 +1171,51 @@ fn depool_has_source(depool: &DePool, source: &HashBytes) -> bool {
     depool.proxies.iter().any(|proxy| &proxy.address == source)
 }
 
+fn simple_stake_unfreeze_wait(
+    elector_data: &ElectorData,
+    elections_end: u32,
+    time_diff: u32,
+) -> Option<Duration> {
+    compute_simple_stake_unfreeze_wait_secs(
+        elector_data.nearest_unfreeze_at(elections_end),
+        elections_end,
+        now_sec(),
+        time_diff,
+    )
+    .map(boundary_wait_secs)
+}
+
+fn compute_simple_stake_unfreeze_wait_secs(
+    unfreeze_at: Option<u32>,
+    elections_end: u32,
+    now: u32,
+    time_diff: u32,
+) -> Option<u32> {
+    let unfreeze_at = unfreeze_at?;
+    let unfreeze_at = unfreeze_at.saturating_add(SIMPLE_STAKE_UNFREEZE_OFFSET_SECS);
+    let elect_deadline = elections_end.saturating_sub(SIMPLE_ELECTIONS_END_OFFSET_SECS);
+
+    if unfreeze_at > elect_deadline {
+        log_info(format!(
+            "stakes will unfreeze after the simple election deadline unfreeze_at={} elections_end={} end_offset={}",
+            unfreeze_at, elections_end, SIMPLE_ELECTIONS_END_OFFSET_SECS
+        ));
+        return None;
+    }
+
+    let until_unfreeze = unfreeze_at.saturating_sub(now);
+    if until_unfreeze == 0 {
+        return None;
+    }
+
+    let wait = until_unfreeze.saturating_add(time_diff);
+    log_info(format!(
+        "waiting for simple stake unfreeze until_unfreeze={} time_diff={} wait={}",
+        until_unfreeze, time_diff, wait
+    ));
+    Some(wait)
+}
+
 fn boundary_wait_secs(wait_secs: u32) -> Duration {
     Duration::from_secs(wait_secs as u64).max(Duration::from_secs(5))
 }
@@ -1338,5 +1431,20 @@ mod tests {
 
         assert_eq!(stake.current, 0);
         assert_eq!(stake.rounds_label, "pooling:3+prev:0");
+    }
+
+    #[test]
+    fn simple_unfreeze_wait_includes_offset_and_time_diff() {
+        let wait = compute_simple_stake_unfreeze_wait_secs(Some(1_000), 2_000, 1_100, 7)
+            .expect("wait for unfreeze");
+
+        assert_eq!(wait, 507);
+    }
+
+    #[test]
+    fn simple_unfreeze_wait_skips_after_election_deadline() {
+        let wait = compute_simple_stake_unfreeze_wait_secs(Some(1_500), 2_000, 1_100, 7);
+
+        assert_eq!(wait, None);
     }
 }
