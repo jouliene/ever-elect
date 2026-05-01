@@ -22,9 +22,6 @@ pub(crate) struct AppConfig {
     pub(crate) node_keys_path: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) elections_path: Option<PathBuf>,
-    pub(crate) send: bool,
-    #[serde(skip_serializing)]
-    pub(crate) once: bool,
     #[serde(skip_serializing)]
     pub(crate) retry: usize,
     #[serde(skip_serializing)]
@@ -51,8 +48,6 @@ impl Default for AppConfig {
             endpoint: DEFAULT_ENDPOINT.to_owned(),
             node_keys_path: PathBuf::from(format!("{home}/.tycho/node_keys.json")),
             elections_path: None,
-            send: false,
-            once: false,
             retry: 3,
             stake_factor: None,
             depool_participate_value: DEFAULT_DEPOOL_PARTICIPATE_VALUE.to_owned(),
@@ -404,7 +399,7 @@ mod tests {
         let object = value.as_object().expect("config object");
 
         for key in [
-            "once",
+            "send",
             "retry",
             "stake_factor",
             "depool_participate_value",
@@ -419,7 +414,6 @@ mod tests {
 
         assert!(object.contains_key("endpoint"));
         assert!(object.contains_key("node_keys_path"));
-        assert!(object.contains_key("send"));
         assert!(object.contains_key("validation"));
     }
 }

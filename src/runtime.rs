@@ -27,7 +27,6 @@ pub(crate) async fn run(config_path: PathBuf) -> Result<()> {
     log_info(format!("validation={}", runtime.validation.name()));
     log_info(format!("wallet={}", runtime.wallet.address()));
     log_info(format!("validator_public={}", node_keys.public_key_hex()));
-    log_info(format!("send_enabled={}", app.send));
 
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
@@ -46,10 +45,6 @@ pub(crate) async fn run(config_path: PathBuf) -> Result<()> {
                         app.error_retry_interval()
                     }
                 };
-
-                if app.once {
-                    break;
-                }
 
                 log_info(format!("sleeping seconds={}", wait.as_secs()));
                 tokio::select! {
@@ -231,17 +226,15 @@ async fn run_simple_election(
         && credit > 0
     {
         log_info(format!("recoverable_previous_stake={credit}"));
-        if app.send {
-            let message = elector.recover_stake_message(price_factor)?;
-            if !simple_wallet_can_transfer(wallet, message.value, transfer_reserve, "recover_stake")
-                .await?
-            {
-                return Ok(app.poll_interval());
-            }
-            let receipt = send_elector_message(wallet, config, &message, app.retry).await?;
-            log_info(format!("recover_message_hash={}", receipt.message_hash));
-            wallet.update().await?;
+        let message = elector.recover_stake_message(price_factor)?;
+        if !simple_wallet_can_transfer(wallet, message.value, transfer_reserve, "recover_stake")
+            .await?
+        {
+            return Ok(app.poll_interval());
         }
+        let receipt = send_elector_message(wallet, config, &message, app.retry).await?;
+        log_info(format!("recover_message_hash={}", receipt.message_hash));
+        wallet.update().await?;
     }
 
     if let Some(member) = current.member(&validator_key) {
@@ -261,11 +254,6 @@ async fn run_simple_election(
         "prepared simple election request election_id={} elector_election_id={} until_end={} stake={} stake_factor={}",
         elections_end, current.elect_at, until_elections_end, stake, stake_factor
     ));
-
-    if !app.send {
-        log_info("dry run enabled; set send=true in ever-elect config to submit stake");
-        return Ok(app.poll_interval());
-    }
 
     let message = elector.participate_message(ParticipateParams {
         node_keys,
@@ -365,11 +353,6 @@ async fn run_depool_election(
         stake_factor
     ));
 
-    if !app.send {
-        log_info("dry run enabled; set send=true in ever-elect config to submit DePool request");
-        return Ok(app.poll_interval());
-    }
-
     let receipt = send_depool_participate_request(
         depool,
         wallet,
@@ -408,10 +391,6 @@ async fn prepare_depool(
         };
 
         log_info(format!("depool_not_active address={}", depool.address));
-        if !app.send {
-            log_info("dry run enabled; skipping DePool topup/deploy");
-            return Ok(());
-        }
 
         let target_balance = DEPOOL_TARGET_BALANCE.max(MIN_BALANCE_FOR_DEPLOY + DEFAULT_DEPOOL_GAS);
         if depool.account_balance < target_balance {
@@ -491,11 +470,6 @@ async fn maintain_depool_balance(
         depool.address, depool.own_balance, depool.account_balance, DEPOOL_TARGET_BALANCE, topup
     ));
 
-    if !app.send {
-        log_info("dry run enabled; skipping DePool balance topup");
-        return Ok(());
-    }
-
     wallet.update().await?;
     if !wallet_can_spend(wallet, app, topup)? {
         log_info(format!(
@@ -552,11 +526,6 @@ async fn maintain_depool_proxy_balances(
             "depool_proxy_balance_low depool={} proxy={} balance={} target={} topup={}",
             depool.address, proxy, proxy_balance, DEPOOL_PROXY_TARGET_BALANCE, topup
         ));
-
-        if !app.send {
-            log_info("dry run enabled; skipping DePool proxy topup");
-            continue;
-        }
 
         wallet.update().await?;
         if !wallet_can_spend(wallet, app, topup)? {
@@ -691,11 +660,6 @@ async fn update_depool_for_election(
             return Ok(None);
         }
 
-        if !app.send {
-            log_info("dry run enabled; skipping DePool ticktock");
-            return Ok(None);
-        }
-
         wallet.update().await?;
         if !wallet_can_spend(wallet, app, DEPOOL_TICKTOCK_VALUE)? {
             log_info(format!(
@@ -792,11 +756,6 @@ async fn ensure_depool_round_stake(
         stake_budget.participate_reserve,
         stake_budget.gas_reserve
     ));
-
-    if !app.send {
-        log_info("dry run enabled; skipping DePool addOrdinaryStake");
-        return Ok(());
-    }
 
     log_info(format!(
         "depool_add_stake depool={} stake={} message_value={} target_rounds={}",
