@@ -132,9 +132,14 @@ fn prompt_validation(config_folder: &str) -> Result<ValidationConfig> {
                 _ => unreachable!(),
             };
 
-            let depool = match prompt_choice("Depool", &["Create new", "Use existing"], 1)? {
+            let depool = match prompt_choice(
+                "Depool",
+                &["Create new", "Restore from seed", "Use existing by address"],
+                1,
+            )? {
                 1 => DepoolConfig::New(prompt_new_depool_config(&validator_wallet)?),
-                2 => {
+                2 => DepoolConfig::New(prompt_restore_depool_config(&validator_wallet)?),
+                3 => {
                     let address = prompt_text("Existing DePool address (workchain 0)", "")?;
                     ensure_workchain(&address, BASECHAIN)?;
                     DepoolConfig::Existing { address }
@@ -201,20 +206,42 @@ fn restore_wallet_config(workchain: i8) -> Result<StoredWalletConfig> {
 fn prompt_new_depool_config(validator_wallet: &StoredWalletConfig) -> Result<NewDepoolConfig> {
     let seed = Seed::generate()?;
     let keys = KeyPair::from_seed(seed.as_str())?;
+    prompt_depool_config_from_keys(
+        "Generated DePool",
+        Some(seed.to_string()),
+        keys,
+        validator_wallet,
+    )
+}
+
+fn prompt_restore_depool_config(validator_wallet: &StoredWalletConfig) -> Result<NewDepoolConfig> {
+    let seed = prompt_text("DePool seed phrase", "")?;
+    let keys = KeyPair::from_seed(&seed)?;
+    prompt_depool_config_from_keys("Restored DePool", Some(seed), keys, validator_wallet)
+}
+
+fn prompt_depool_config_from_keys(
+    title: &str,
+    seed: Option<String>,
+    keys: KeyPair,
+    validator_wallet: &StoredWalletConfig,
+) -> Result<NewDepoolConfig> {
     let address = DePool::compute_address(BASECHAIN, &keys)?.to_string();
     let min_stake = prompt_token_amount("DePool min stake", "100")?;
     let validator_assurance = prompt_token_amount("Validator assurance", "500")?;
     let participant_reward_fraction = prompt_u8("Participant reward fraction", 95)?;
 
-    println!("Generated DePool:");
+    println!("{title}:");
     println!("  address:          {address}");
     println!("  public:           {}", keys.public_key_hex());
-    println!("  seed:             {}", seed.as_str());
+    if let Some(seed) = &seed {
+        println!("  seed:             {seed}");
+    }
     println!("  validator wallet: {}", validator_wallet.address);
 
     Ok(NewDepoolConfig {
         address,
-        seed: Some(seed.to_string()),
+        seed,
         public: keys.public_key_hex(),
         secret: keys.secret_key_hex(),
         min_stake,
