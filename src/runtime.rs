@@ -799,14 +799,19 @@ async fn update_depool_for_election(
         }
 
         wallet.update().await?;
-        if !wallet_can_spend(wallet, app, DEPOOL_TICKTOCK_VALUE)? {
+        if !wallet_can_send_depool_validator_operation(wallet, app, DEPOOL_TICKTOCK_VALUE)? {
             log_info(format!(
                 "wallet balance is too low for DePool ticktock balance={} value={} reserve={}",
                 wallet.balance(),
                 DEPOOL_TICKTOCK_VALUE,
-                wallet_operation_reserve(app)?
+                depool_validator_operation_reserve(app)?
             ));
-            log_validator_wallet_topup(wallet, app, DEPOOL_TICKTOCK_VALUE, "depool_ticktock")?;
+            log_depool_validator_operation_topup(
+                wallet,
+                app,
+                DEPOOL_TICKTOCK_VALUE,
+                "depool_ticktock",
+            )?;
             return Ok(DePoolElectionUpdate::NotReady);
         }
 
@@ -863,11 +868,11 @@ async fn ensure_depool_round_stake(
             "wallet balance is too low for DePool staking balance={} required={} wallet_reserve={} participate_reserve={} gas_reserve={}",
             wallet.balance(),
             required,
-            app.depool_wallet_reserve_nano()?,
+            0,
             app.depool_participate_value_nano()?,
             DEFAULT_DEPOOL_GAS
         ));
-        log_validator_wallet_topup(wallet, app, stake_message_value, "depool_add_stake")?;
+        log_depool_validator_operation_topup(wallet, app, stake_message_value, "depool_add_stake")?;
         return Ok(());
     };
 
@@ -882,7 +887,7 @@ async fn ensure_depool_round_stake(
             stake_budget.stake,
             round_stake.rounds_label
         ));
-        log_validator_wallet_topup(wallet, app, stake_message_value, "depool_add_stake")?;
+        log_depool_validator_operation_topup(wallet, app, stake_message_value, "depool_add_stake")?;
         return Ok(());
     }
 
@@ -934,20 +939,66 @@ struct DePoolStakeBudget {
 }
 
 fn depool_available_stake(balance: u128, app: &AppConfig) -> Result<Option<DePoolStakeBudget>> {
-    let wallet_reserve = app.depool_wallet_reserve_nano()?;
+    // Validator stake must be in the pool before elections; keep only the budget
+    // required for the follow-up DePool participate request.
+    let wallet_reserve = 0_u128;
     let participate_reserve = app.depool_participate_value_nano()?;
     let gas_reserve = DEFAULT_DEPOOL_GAS;
     let total_reserve = wallet_reserve
         .saturating_add(participate_reserve)
         .saturating_add(gas_reserve)
-        .saturating_add(DEFAULT_DEPOOL_GAS);
+        .saturating_add(DEFAULT_DEPOOL_GAS)
+        .saturating_add(1);
 
-    Ok((balance > total_reserve).then_some(DePoolStakeBudget {
+    Ok((balance >= total_reserve).then_some(DePoolStakeBudget {
         stake: balance - total_reserve,
         wallet_reserve,
         participate_reserve,
         gas_reserve,
     }))
+}
+
+fn depool_validator_operation_reserve(app: &AppConfig) -> Result<u128> {
+    Ok(app
+        .depool_participate_value_nano()?
+        .saturating_add(DEFAULT_DEPOOL_GAS))
+}
+
+fn depool_validator_operation_required_balance(
+    app: &AppConfig,
+    operation_value: u128,
+) -> Result<u128> {
+    Ok(operation_value
+        .saturating_add(depool_validator_operation_reserve(app)?)
+        .saturating_add(1))
+}
+
+fn wallet_can_send_depool_validator_operation(
+    wallet: &EverWallet,
+    app: &AppConfig,
+    value: u128,
+) -> Result<bool> {
+    Ok(wallet.balance() >= depool_validator_operation_required_balance(app, value)?)
+}
+
+fn log_depool_validator_operation_topup(
+    wallet: &EverWallet,
+    app: &AppConfig,
+    operation_value: u128,
+    reason: &str,
+) -> Result<()> {
+    let required_balance = depool_validator_operation_required_balance(app, operation_value)?;
+    log_info(format!(
+        "topup_validator_wallet wallet={} with_at_least={} reason={} balance={} required_balance={} operation_value={} reserve={}",
+        wallet.address(),
+        required_balance.saturating_sub(wallet.balance()),
+        reason,
+        wallet.balance(),
+        required_balance,
+        operation_value,
+        depool_validator_operation_reserve(app)?
+    ));
+    Ok(())
 }
 
 fn required_depool_stake(depool: &DePool, config: &DepoolRuntimeConfig) -> Result<u64> {
@@ -1471,6 +1522,36 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn depool_stake_budget_allows_assurance_without_idle_wallet_reserve() {
+        let app = AppConfig::default();
+        let budget = depool_available_stake(518_043_070_324, &app)
+            .expect("stake budget")
+            .expect("wallet has validator operation budget");
+
+        assert_eq!(budget.wallet_reserve, 0);
+        assert_eq!(budget.participate_reserve, 5_000_000_000);
+        assert_eq!(budget.gas_reserve, DEFAULT_DEPOOL_GAS);
+        assert_eq!(budget.stake, 512_043_070_323);
+        assert!(budget.stake >= 500_000_000_000);
+    }
+
+    #[test]
+    fn depool_validator_operations_do_not_require_idle_wallet_reserve() {
+        let app = AppConfig::default();
+        let stake_message_value = 500_500_000_000;
+
+        assert_eq!(
+            depool_validator_operation_required_balance(&app, stake_message_value)
+                .expect("validator operation balance"),
+            506_000_000_001
+        );
+        assert_eq!(
+            wallet_required_balance(&app, stake_message_value).expect("regular operation balance"),
+            526_000_000_001
+        );
     }
 
     #[test]
