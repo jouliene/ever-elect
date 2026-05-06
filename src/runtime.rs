@@ -763,6 +763,18 @@ async fn update_depool_for_election(
         ));
 
         if target_round.supposed_elected_at == election_id {
+            if target_round.stake < required_stake {
+                log_info(format!(
+                    "depool target round stake is too low depool={} election_id={} round_id={} stake={} required={}",
+                    depool.address,
+                    election_id,
+                    target_round.id,
+                    target_round.stake,
+                    required_stake
+                ));
+                return Ok(DePoolElectionUpdate::NotReady);
+            }
+
             return Ok(DePoolElectionUpdate::Ready(target_round));
         }
 
@@ -1287,10 +1299,11 @@ fn select_target_depool_round_from_state(
         .iter()
         .find(|round| round.supposed_elected_at == election_id && round.stake >= required_stake)
         .or_else(|| {
-            rounds.iter().find(|round| {
-                round.step == DEPOOL_ROUND_STEP_POOLING && round.stake >= required_stake
-            })
+            rounds
+                .iter()
+                .find(|round| round.supposed_elected_at == election_id)
         })
+        .or_else(|| depool_queue_target_round(rounds))
     else {
         return Ok(None);
     };
@@ -1305,6 +1318,16 @@ fn select_target_depool_round_from_state(
         stake: round.stake,
         validator_stake: round.validator_stake,
     }))
+}
+
+fn depool_queue_target_round(rounds: &[DePoolRound]) -> Option<&DePoolRound> {
+    // Standard DePool keeps sorted active rounds as previous, target, pooling,
+    // pre-pooling. Ticktock configures the target round for the current election.
+    rounds.get(1).or_else(|| {
+        rounds
+            .iter()
+            .find(|round| round.step == DEPOOL_ROUND_STEP_POOLING)
+    })
 }
 
 fn format_depool_rounds(depool: &DePool) -> String {
@@ -1555,25 +1578,26 @@ mod tests {
     }
 
     #[test]
-    fn selects_funded_pooling_round_as_ticktock_candidate() {
+    fn selects_queue_target_round_when_pooling_round_is_empty() {
         let rounds = vec![
-            depool_round(0, 9, 0, 0),
-            depool_round(1, 6, 0, 0),
-            depool_round(2, DEPOOL_ROUND_STEP_POOLING, 505_000_000_000_000, 0),
-            depool_round(3, 0, 0, 0),
+            depool_round(2, 3, 505_000_000_000_000, 1_777_634_017),
+            depool_round(3, 3, 505_000_000_000_000, 1_777_699_553),
+            depool_round(4, DEPOOL_ROUND_STEP_POOLING, 0, 0),
+            depool_round(5, 0, 0, 0),
         ];
 
         let selected = select_target_depool_round_from_state(
             &rounds,
             &[proxy()],
             5_000_000_000_000,
-            1_777_634_017,
+            1_778_092_769,
         )
         .expect("select target round")
-        .expect("pooling round should be selected");
+        .expect("queue target round should be selected");
 
-        assert_eq!(selected.id, 2);
-        assert_eq!(selected.step, DEPOOL_ROUND_STEP_POOLING);
+        assert_eq!(selected.id, 3);
+        assert_eq!(selected.step, 3);
+        assert_eq!(selected.supposed_elected_at, 1_777_699_553);
     }
 
     #[test]
